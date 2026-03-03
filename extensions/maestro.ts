@@ -47,7 +47,31 @@ interface AgentDef {
 	systemPrompt: string;
 }
 
+interface AgentCardState {
+	def: AgentDef;
+	status: "idle" | "running" | "done" | "error";
+	elapsed: number;
+	lastLine: string;
+	task: string;
+	queryCount: number;
+}
+
 type PhaseStatus = "pending" | "running" | "done" | "error" | "rejected" | "skipped";
+
+// ─── Agent Colors (pi-pi style) ───────────────────────────────────────────────
+
+const FG_RESET = "\x1b[39m";
+const BG_RESET = "\x1b[49m";
+
+const AGENT_COLORS: Record<string, { bg: string; br: string }> = {
+	"scout":             { bg: "\x1b[48;2;18;50;80m",  br: "\x1b[38;2;60;160;220m"  }, // steel blue
+	"planner":           { bg: "\x1b[48;2;18;65;30m",  br: "\x1b[38;2;55;175;90m"   }, // forest green
+	"builder":           { bg: "\x1b[48;2;80;55;12m",  br: "\x1b[38;2;215;150;40m"  }, // amber
+	"reviewer":          { bg: "\x1b[48;2;50;22;85m",  br: "\x1b[38;2;145;80;220m"  }, // violet
+	"tester":            { bg: "\x1b[48;2;12;65;75m",  br: "\x1b[38;2;40;175;195m"  }, // teal
+	"playwright-tester": { bg: "\x1b[48;2;80;18;28m",  br: "\x1b[38;2;210;65;85m"   }, // crimson
+	"committer":         { bg: "\x1b[48;2;28;42;80m",  br: "\x1b[38;2;85;120;210m"  }, // slate blue
+};
 
 interface PhaseState {
 	name: string;
@@ -324,6 +348,7 @@ export default function (pi: ExtensionAPI) {
 	let pipelineActive = false;
 	let widgetCtx: any = null;
 	const agentSessions = new Map<string, string>(); // key → session file path
+	const agentCards = new Map<string, AgentCardState>(); // widget card state per agent
 
 	// ─── Damage Control Intercept ──────────────────────────────────────────
 
@@ -358,28 +383,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ─── Widget ────────────────────────────────────────────────────────────
-
-	function statusIcon(status: PhaseStatus): string {
-		switch (status) {
-			case "pending": return "○";
-			case "running": return "⟳";
-			case "done": return "✓";
-			case "error": return "✗";
-			case "rejected": return "↩";
-			case "skipped": return "–";
-		}
-	}
-
-	function statusColor(status: PhaseStatus): string {
-		switch (status) {
-			case "done": return "success";
-			case "running": return "accent";
-			case "error": return "error";
-			case "rejected": return "warning";
-			default: return "dim";
-		}
-	}
+	// ─── Widget (pi-pi card style) ────────────────────────────────────────
 
 	function formatElapsed(ms: number): string {
 		if (ms < 1000) return "";
@@ -387,101 +391,99 @@ export default function (pi: ExtensionAPI) {
 		return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
 	}
 
-	/** Render a single phase as a card (returns string[] of lines) */
-	function renderPhaseCard(p: PhaseState, w: number, th: any): string[] {
-		const col = statusColor(p.status);
-		const icon = statusIcon(p.status);
-		const inner = w - 2; // subtract borders
+	function renderCard(state: AgentCardState, colWidth: number, theme: any): string[] {
+		const w = colWidth - 2;
+		const trunc = (s: string, max: number) => s.length > max ? s.slice(0, max - 3) + "..." : s;
 
-		const border = (content: string, visLen: number) =>
-			th.fg("dim", "│") + content + " ".repeat(Math.max(0, inner - visLen)) + th.fg("dim", "│");
+		const statusCol = state.status === "idle" ? "dim"
+			: state.status === "running" ? "accent"
+			: state.status === "done" ? "success" : "error";
+		const statusIcon = state.status === "idle" ? "○"
+			: state.status === "running" ? "◉"
+			: state.status === "done" ? "✓" : "✗";
 
-		const top = th.fg("dim", "┌" + "─".repeat(inner) + "┐");
-		const bot = th.fg("dim", "└" + "─".repeat(inner) + "┘");
+		const name = displayName(state.def.name);
+		const nameStr = theme.fg("accent", theme.bold(trunc(name, w)));
+		const nameVisible = Math.min(name.length, w);
 
-		// Line 1: phase label (bold accent when running, else col)
-		const labelStr = truncateToWidth(p.label, inner - 1);
-		const labelLine = border(
-			" " + (p.status === "running" ? th.fg("accent", th.bold(labelStr)) : th.fg(col, labelStr)),
-			1 + visibleWidth(labelStr),
-		);
+		const timeStr = state.status !== "idle" ? ` ${Math.round(state.elapsed / 1000)}s` : "";
+		const queriesStr = state.queryCount > 0 ? ` (${state.queryCount})` : "";
+		const statusRaw = `${statusIcon} ${state.status}${timeStr}${queriesStr}`;
+		const statusLine = theme.fg(statusCol, statusRaw);
+		const statusVisible = statusRaw.length;
 
-		// Line 2: status + elapsed
-		const elapsed = formatElapsed(p.elapsed);
-		const statusStr = truncateToWidth(`${icon} ${p.status}${elapsed ? "  " + elapsed : ""}`, inner - 1);
-		const statusLine = border(" " + th.fg(col, statusStr), 1 + visibleWidth(statusStr));
+		const workRaw = state.task ? (state.lastLine || state.task) : state.def.description;
+		const workText = trunc(workRaw, Math.min(50, w - 1));
+		const workLine = theme.fg("muted", workText);
+		const workVisible = workText.length;
 
-		// Line 3: agents or retries
-		let agentStr = p.agentNames.length > 0
-			? truncateToWidth(p.agentNames.join(", "), inner - 1)
-			: truncateToWidth(p.maxRetries > 0 ? `retry ${p.retries}/${p.maxRetries}` : p.name, inner - 1);
-		const agentLine = border(" " + th.fg("muted", agentStr), 1 + visibleWidth(agentStr));
+		const lastRaw = state.lastLine && state.task ? state.lastLine : "";
+		const lastText = trunc(lastRaw, Math.min(50, w - 1));
+		const lastLine = lastText ? theme.fg("dim", lastText) : theme.fg("dim", "—");
+		const lastVisible = lastText ? lastText.length : 1;
 
-		// Line 4: last work / rejection reason (dynamic)
-		let workStr = "";
-		if (p.status === "rejected" && p.rejectionReason) {
-			workStr = truncateToWidth(`↳ ${p.rejectionReason}`, inner - 1);
-		} else if (p.status === "running" && p.lastWork) {
-			workStr = truncateToWidth(p.lastWork, inner - 1);
+		const colors = AGENT_COLORS[state.def.name.toLowerCase()];
+		const bg  = colors?.bg ?? "";
+		const br  = colors?.br ?? "";
+		const bgr = bg ? BG_RESET : "";
+		const fgr = br ? FG_RESET : "";
+
+		const bord = (s: string) => bg + br + s + bgr + fgr;
+		const top = "┌" + "─".repeat(w) + "┐";
+		const bot = "└" + "─".repeat(w) + "┘";
+		const border = (content: string, visLen: number) => {
+			const pad = " ".repeat(Math.max(0, w - visLen));
+			return bord("│") + bg + content + bg + pad + bgr + bord("│");
+		};
+
+		return [
+			bord(top),
+			border(" " + nameStr,   1 + nameVisible),
+			border(" " + statusLine, 1 + statusVisible),
+			border(" " + workLine,  1 + workVisible),
+			border(" " + lastLine,  1 + lastVisible),
+			bord(bot),
+		];
+	}
+
+	function initAgentCards() {
+		agentCards.clear();
+		for (const [key, def] of agents) {
+			agentCards.set(key, {
+				def, status: "idle", elapsed: 0,
+				lastLine: "", task: "", queryCount: 0,
+			});
 		}
-		const workLine = border(
-			" " + (workStr ? th.fg("dim", workStr) : th.fg("dim", "")),
-			1 + visibleWidth(workStr),
-		);
-
-		return [top, labelLine, statusLine, agentLine, workLine, bot];
 	}
 
 	function updateWidget() {
 		if (!widgetCtx) return;
 
-		widgetCtx.ui.setWidget("maestro", (_tui: any, th: any) => {
+		widgetCtx.ui.setWidget("maestro", (_tui: any, theme: any) => {
 			return {
 				render(width: number): string[] {
-					// ── Idle state: agent roster ────────────────────────────────
-					if (phases.length === 0) {
-						const lines: string[] = [""];
-						const title = th.fg("accent", th.bold(" Maestro")) +
-							th.fg("dim", "  Scout → Plan → Build → Review → Test → Commit");
-						lines.push(title);
-						lines.push(th.fg("dim", " " + "─".repeat(Math.min(width - 2, 60))));
-
-						const agentList = Array.from(agents.values());
-						if (agentList.length === 0) {
-							lines.push(th.fg("dim", "  No agents found in .pi/agents/maestro/"));
-						} else {
-							for (const a of agentList) {
-								const nameStr = displayName(a.name).padEnd(18);
-								const descStr = truncateToWidth(a.description, Math.max(10, width - 22));
-								lines.push(
-									" " + th.fg("accent", nameStr) + "  " + th.fg("dim", descStr),
-								);
-							}
-						}
-						lines.push("");
-						lines.push(th.fg("dim", "  /pipeline  /agents  · run_pipeline to start"));
-						return lines;
+					const cards = Array.from(agentCards.values());
+					if (cards.length === 0) {
+						return ["", theme.fg("dim", "  No agents found in .pi/agents/maestro/")];
 					}
 
-					// ── Active pipeline: phase cards grid ───────────────────────
-					const cols = Math.min(3, phases.length);
+					const cols = Math.min(3, cards.length);
 					const gap = 1;
-					const colWidth = Math.floor((width - gap * (cols - 1)) / cols);
+					const colWidth = Math.floor((width - gap * (cols - 1)) / cols) - 1;
 
 					const lines: string[] = [""];
 
-					for (let i = 0; i < phases.length; i += cols) {
-						const row = phases.slice(i, i + cols);
-						const cards = row.map((p) => renderPhaseCard(p, colWidth, th));
+					for (let i = 0; i < cards.length; i += cols) {
+						const row = cards.slice(i, i + cols);
+						const cardLines = row.map((c) => renderCard(c, colWidth, theme));
 
-						// Pad to cols if last row is shorter
-						while (cards.length < cols) {
-							cards.push(Array(6).fill(" ".repeat(colWidth)));
+						while (cardLines.length < cols) {
+							cardLines.push(Array(6).fill(" ".repeat(colWidth)));
 						}
 
-						const height = cards[0].length;
+						const height = cardLines[0].length;
 						for (let l = 0; l < height; l++) {
-							lines.push(cards.map((c) => c[l] ?? "").join(" ".repeat(gap)));
+							lines.push(cardLines.map((c) => c[l] ?? "").join(" ".repeat(gap)));
 						}
 					}
 
@@ -513,13 +515,38 @@ export default function (pi: ExtensionAPI) {
 		phase: PhaseState,
 		model: string,
 	): Promise<{ output: string; exitCode: number }> {
+		const cardKey = def.name.toLowerCase();
+		const card = agentCards.get(cardKey);
+		const startTime = Date.now();
+
+		if (card) {
+			card.status = "running";
+			card.task = task.slice(0, 80);
+			card.elapsed = 0;
+			card.lastLine = "";
+			card.queryCount++;
+		}
+
+		// Elapsed timer for card
+		const elapsedTimer = setInterval(() => {
+			if (card) { card.elapsed = Date.now() - startTime; updateWidget(); }
+		}, 1000);
+
 		const { file, resume } = sessionFor(sessionKey);
 		const result = await runAgentProcess(def, task, model, file, resume, (delta) => {
-			const full = (phase.lastWork + delta).split("\n").filter((l) => l.trim()).pop() ?? "";
-			phase.lastWork = full;
+			const line = delta.split("\n").filter((l) => l.trim()).pop() ?? "";
+			if (card && line) { card.lastLine = line; }
+			phase.lastWork = line || phase.lastWork;
 			updateWidget();
 		});
+
+		clearInterval(elapsedTimer);
+		if (card) {
+			card.status = result.exitCode === 0 ? "done" : "error";
+			card.elapsed = Date.now() - startTime;
+		}
 		if (result.exitCode === 0) agentSessions.set(sessionKey, file);
+		updateWidget();
 		return result;
 	}
 
@@ -537,7 +564,6 @@ export default function (pi: ExtensionAPI) {
 		phaseState.agentNames = count === 1
 			? [displayName(agentName)]
 			: Array.from({ length: count }, (_, i) => `${displayName(agentName)} ${i + 1}`);
-		updateWidget();
 
 		const promises = Array.from({ length: count }, (_, i) => {
 			const key = count === 1 ? agentName : `${agentName}-${i}`;
@@ -577,6 +603,9 @@ export default function (pi: ExtensionAPI) {
 
 		const model = getModel(ctx);
 		pipelineActive = true;
+
+		// Reset all agent cards to idle for the new run
+		initAgentCards();
 
 		// ── Initialise phase list ──────────────────────────────────────────
 		phases = [
@@ -850,6 +879,8 @@ export default function (pi: ExtensionAPI) {
 		// Lock down to orchestrator-only tools
 		pi.setActiveTools(["run_pipeline", "dispatch_agent", "commit_and_pr"]);
 
+		initAgentCards();
+
 		const agentCount = agents.size;
 		const dmgActive = Object.keys(damageRules).length > 0;
 		ctx.ui.setStatus("maestro", `Maestro (${agentCount} agents${dmgActive ? " · 🛡" : ""})`);
@@ -976,11 +1007,6 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const phase: PhaseState = {
-				name: agent, label: displayName(agent), agentNames: [displayName(agent)],
-				status: "running", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "",
-			};
-
 			if (onUpdate) {
 				onUpdate({
 					content: [{ type: "text", text: `Dispatching ${displayName(agent)}…` }],
@@ -989,17 +1015,15 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const model = getModel(ctx);
-			const { file, resume } = sessionFor(agent);
-			const result = await runAgentProcess(def, task, model, file, resume, (delta) => {
-				phase.lastWork = delta.split("\n").filter(Boolean).pop() ?? "";
-			});
-
-			if (result.exitCode === 0) agentSessions.set(agent, file);
-			phase.status = result.exitCode === 0 ? "done" : "error";
+			const fakePhase: PhaseState = {
+				name: agent, label: displayName(agent), agentNames: [displayName(agent)],
+				status: "running", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "",
+			};
+			const result = await runAgent(def, task, agent, fakePhase, model);
 
 			return {
 				content: [{ type: "text", text: result.output }],
-				details: { agent, exitCode: result.exitCode, elapsed: result.elapsed },
+				details: { agent, exitCode: result.exitCode },
 			};
 		},
 
