@@ -804,22 +804,23 @@ export default function (pi: ExtensionAPI) {
 		pi.setActiveTools(["run_pipeline", "dispatch_agent", "commit_and_pr"]);
 
 		// Footer: model + damage control indicator + phase status
-		ctx.ui.setFooter((_tui: any, th: any, width: number) => {
-			const modelStr = ctx.model
-				? `${ctx.model.provider}/${ctx.model.id}`
-				: "no model";
-			const phase = pipelineActive
-				? (phases.find((p) => p.status === "running")?.label ?? "running")
-				: "idle";
-			const dmg = Object.keys(damageRules).length > 0 ? " 🛡" : "";
-			const right = `${dmg} ${modelStr}`;
-			const left = `Maestro › ${phase}`;
-			const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(right));
-			return (
-				th.fg("accent", left) +
-				" ".repeat(gap) +
-				th.fg("dim", right)
-			);
+		ctx.ui.setFooter((_tui: any, th: any, _footerData: any) => {
+			return {
+				invalidate() {},
+				render(width: number): string[] {
+					const modelStr = ctx.model
+						? `${ctx.model.provider}/${ctx.model.id}`
+						: "no model";
+					const phase = pipelineActive
+						? (phases.find((p) => p.status === "running")?.label ?? "running")
+						: "idle";
+					const dmg = Object.keys(damageRules).length > 0 ? " 🛡" : "";
+					const right = `${dmg} ${modelStr}`;
+					const left = `Maestro › ${phase}`;
+					const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(right));
+					return [th.fg("accent", left) + " ".repeat(gap) + th.fg("dim", right)];
+				},
+			};
 		});
 	});
 
