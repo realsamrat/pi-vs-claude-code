@@ -34,7 +34,8 @@ import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { parse as yamlParse } from "yaml";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
@@ -231,9 +232,16 @@ function checkPathAccess(
 
 // ─── Agent Loading ────────────────────────────────────────────────────────────
 
+// Directory containing this extension file — used as fallback agent location
+// when running maestro from a project that has no local .pi/agents/maestro/
+const EXTENSION_REPO_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
+
 function loadAgents(cwd: string): Map<string, AgentDef> {
 	const agents = new Map<string, AgentDef>();
-	const maestroDir = join(cwd, ".pi", "agents", "maestro");
+	// Prefer local project agents; fall back to the extension repo's own agents
+	const localDir  = join(cwd, ".pi", "agents", "maestro");
+	const globalDir = join(EXTENSION_REPO_DIR, ".pi", "agents", "maestro");
+	const maestroDir = existsSync(localDir) ? localDir : globalDir;
 
 	if (!existsSync(maestroDir)) return agents;
 
@@ -337,7 +345,8 @@ function runAgentProcess(
 export default function (pi: ExtensionAPI) {
 	const cwd = process.cwd();
 
-	// Directories
+	// Sessions always live under the current project's .pi/ so each project
+	// has its own agent memory even when the extension is loaded globally
 	const sessionDir = join(cwd, ".pi", "agent-sessions", "maestro");
 	if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 
