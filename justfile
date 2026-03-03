@@ -65,6 +65,10 @@ ext-agent-chain:
 ext-pi-pi:
     pi -e extensions/pi-pi.ts -e extensions/theme-cycler.ts
 
+# 17. Maestro: all-in-one conditional pipeline — Scout→Plan→Build→Review Gate→Test Gate→Commit
+ext-maestro:
+    pi -e extensions/maestro.ts -e extensions/theme-cycler.ts
+
 #ext
 
 # 15. Session Replay: scrollable timeline overlay of session history (legit)
