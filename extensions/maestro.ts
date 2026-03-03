@@ -371,77 +371,123 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function statusColor(status: PhaseStatus): string {
+		switch (status) {
+			case "done": return "success";
+			case "running": return "accent";
+			case "error": return "error";
+			case "rejected": return "warning";
+			default: return "dim";
+		}
+	}
+
 	function formatElapsed(ms: number): string {
 		if (ms < 1000) return "";
 		const s = Math.round(ms / 1000);
 		return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
 	}
 
+	/** Render a single phase as a card (returns string[] of lines) */
+	function renderPhaseCard(p: PhaseState, w: number, th: any): string[] {
+		const col = statusColor(p.status);
+		const icon = statusIcon(p.status);
+		const inner = w - 2; // subtract borders
+
+		const border = (content: string, visLen: number) =>
+			th.fg("dim", "│") + content + " ".repeat(Math.max(0, inner - visLen)) + th.fg("dim", "│");
+
+		const top = th.fg("dim", "┌" + "─".repeat(inner) + "┐");
+		const bot = th.fg("dim", "└" + "─".repeat(inner) + "┘");
+
+		// Line 1: phase label (bold accent when running, else col)
+		const labelStr = truncateToWidth(p.label, inner - 1);
+		const labelLine = border(
+			" " + (p.status === "running" ? th.fg("accent", th.bold(labelStr)) : th.fg(col, labelStr)),
+			1 + visibleWidth(labelStr),
+		);
+
+		// Line 2: status + elapsed
+		const elapsed = formatElapsed(p.elapsed);
+		const statusStr = truncateToWidth(`${icon} ${p.status}${elapsed ? "  " + elapsed : ""}`, inner - 1);
+		const statusLine = border(" " + th.fg(col, statusStr), 1 + visibleWidth(statusStr));
+
+		// Line 3: agents or retries
+		let agentStr = p.agentNames.length > 0
+			? truncateToWidth(p.agentNames.join(", "), inner - 1)
+			: truncateToWidth(p.maxRetries > 0 ? `retry ${p.retries}/${p.maxRetries}` : p.name, inner - 1);
+		const agentLine = border(" " + th.fg("muted", agentStr), 1 + visibleWidth(agentStr));
+
+		// Line 4: last work / rejection reason (dynamic)
+		let workStr = "";
+		if (p.status === "rejected" && p.rejectionReason) {
+			workStr = truncateToWidth(`↳ ${p.rejectionReason}`, inner - 1);
+		} else if (p.status === "running" && p.lastWork) {
+			workStr = truncateToWidth(p.lastWork, inner - 1);
+		}
+		const workLine = border(
+			" " + (workStr ? th.fg("dim", workStr) : th.fg("dim", "")),
+			1 + visibleWidth(workStr),
+		);
+
+		return [top, labelLine, statusLine, agentLine, workLine, bot];
+	}
+
 	function updateWidget() {
-		if (!widgetCtx || phases.length === 0) return;
+		if (!widgetCtx) return;
 
 		widgetCtx.ui.setWidget("maestro", (_tui: any, th: any) => {
-			const text = new Text("", 0, 1);
-
 			return {
 				render(width: number): string[] {
+					// ── Idle state: agent roster ────────────────────────────────
 					if (phases.length === 0) {
-						text.setText("");
-						return text.render(width);
+						const lines: string[] = [""];
+						const title = th.fg("accent", th.bold(" Maestro")) +
+							th.fg("dim", "  Scout → Plan → Build → Review → Test → Commit");
+						lines.push(title);
+						lines.push(th.fg("dim", " " + "─".repeat(Math.min(width - 2, 60))));
+
+						const agentList = Array.from(agents.values());
+						if (agentList.length === 0) {
+							lines.push(th.fg("dim", "  No agents found in .pi/agents/maestro/"));
+						} else {
+							for (const a of agentList) {
+								const nameStr = displayName(a.name).padEnd(18);
+								const descStr = truncateToWidth(a.description, Math.max(10, width - 22));
+								lines.push(
+									" " + th.fg("accent", nameStr) + "  " + th.fg("dim", descStr),
+								);
+							}
+						}
+						lines.push("");
+						lines.push(th.fg("dim", "  /pipeline  /agents  · run_pipeline to start"));
+						return lines;
 					}
 
-					const colW = [14, 22, 10, 10, 8];
-					const rows: string[] = [];
+					// ── Active pipeline: phase cards grid ───────────────────────
+					const cols = Math.min(3, phases.length);
+					const gap = 1;
+					const colWidth = Math.floor((width - gap * (cols - 1)) / cols);
 
-					// Header
-					const header = [
-						truncateToWidth("Phase", colW[0]),
-						truncateToWidth("Agents", colW[1]),
-						truncateToWidth("Status", colW[2]),
-						truncateToWidth("Retries", colW[3]),
-						truncateToWidth("Time", colW[4]),
-					]
-						.map((c, i) => th.fg("dim", c.padEnd(colW[i])))
-						.join("  ");
-					rows.push(header);
-					rows.push(th.fg("dim", "─".repeat(Math.min(width, 74))));
+					const lines: string[] = [""];
 
-					for (const p of phases) {
-						const icon = statusIcon(p.status);
-						const iconColor =
-							p.status === "done" ? "success"
-							: p.status === "running" ? "accent"
-							: p.status === "error" || p.status === "rejected" ? "warning"
-							: "dim";
+					for (let i = 0; i < phases.length; i += cols) {
+						const row = phases.slice(i, i + cols);
+						const cards = row.map((p) => renderPhaseCard(p, colWidth, th));
 
-						const col0 = truncateToWidth(p.label, colW[0]).padEnd(colW[0]);
-						const col1 = truncateToWidth(p.agentNames.join(", "), colW[1]).padEnd(colW[1]);
-						const col2 = truncateToWidth(`${icon} ${p.status}`, colW[2]).padEnd(colW[2]);
-						const col3 = (p.maxRetries > 0 ? `${p.retries}/${p.maxRetries}` : "").padEnd(colW[3]);
-						const col4 = formatElapsed(p.elapsed).padEnd(colW[4]);
-
-						rows.push(
-							th.fg(iconColor, col0) + "  " +
-							th.fg("muted", col1) + "  " +
-							th.fg(iconColor, col2) + "  " +
-							th.fg("dim", col3) + "  " +
-							th.fg("dim", col4),
-						);
-
-						if (p.status === "rejected" && p.rejectionReason) {
-							rows.push(th.fg("warning", truncateToWidth(`  ↳ ${p.rejectionReason}`, width - 2)));
+						// Pad to cols if last row is shorter
+						while (cards.length < cols) {
+							cards.push(Array(6).fill(" ".repeat(colWidth)));
 						}
-						if (p.status === "running" && p.lastWork) {
-							rows.push(th.fg("dim", truncateToWidth(`  › ${p.lastWork}`, width - 2)));
+
+						const height = cards[0].length;
+						for (let l = 0; l < height; l++) {
+							lines.push(cards.map((c) => c[l] ?? "").join(" ".repeat(gap)));
 						}
 					}
 
-					text.setText(rows.join("\n"));
-					return text.render(width);
+					return lines;
 				},
-				invalidate() {
-					text.invalidate();
-				},
+				invalidate() {},
 			};
 		});
 	}
@@ -798,30 +844,53 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
+		if (widgetCtx) widgetCtx.ui.setWidget("maestro", undefined);
 		widgetCtx = ctx;
 
 		// Lock down to orchestrator-only tools
 		pi.setActiveTools(["run_pipeline", "dispatch_agent", "commit_and_pr"]);
 
-		// Footer: model + damage control indicator + phase status
-		ctx.ui.setFooter((_tui: any, th: any, _footerData: any) => {
-			return {
-				invalidate() {},
-				render(width: number): string[] {
-					const modelStr = ctx.model
-						? `${ctx.model.provider}/${ctx.model.id}`
-						: "no model";
-					const phase = pipelineActive
-						? (phases.find((p) => p.status === "running")?.label ?? "running")
-						: "idle";
-					const dmg = Object.keys(damageRules).length > 0 ? " 🛡" : "";
-					const right = `${dmg} ${modelStr}`;
-					const left = `Maestro › ${phase}`;
-					const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(right));
-					return [th.fg("accent", left) + " ".repeat(gap) + th.fg("dim", right)];
-				},
-			};
-		});
+		const agentCount = agents.size;
+		const dmgActive = Object.keys(damageRules).length > 0;
+		ctx.ui.setStatus("maestro", `Maestro (${agentCount} agents${dmgActive ? " · 🛡" : ""})`);
+
+		updateWidget();
+
+		ctx.ui.notify(
+			`Maestro loaded — ${agentCount} agents ready\n\n` +
+			`Pipeline: Scout → Plan → Build → Review Gate → Test Gate → Commit+PR\n` +
+			`Review/test gates loop back on REJECTED (up to 3×/2×)\n\n` +
+			`/pipeline     Show pipeline status\n` +
+			`/agents       List all agents`,
+			"info",
+		);
+
+		// Footer: model · Maestro | phase | [context bar]%
+		ctx.ui.setFooter((_tui: any, th: any, _footerData: any) => ({
+			dispose: () => {},
+			invalidate() {},
+			render(width: number): string[] {
+				const model = ctx.model?.id ?? "no-model";
+				const usage = ctx.getContextUsage?.();
+				const pct = usage ? usage.percent : 0;
+				const filled = Math.round(pct / 10);
+				const bar = "#".repeat(filled) + "-".repeat(10 - filled);
+
+				const runningPhase = phases.find((p) => p.status === "running");
+				const mid = pipelineActive && runningPhase
+					? th.fg("accent", ` ◉ ${runningPhase.label}`)
+					: phases.length > 0 && !pipelineActive
+					? th.fg("success", " ✓ done")
+					: "";
+
+				const dmgStr = dmgActive ? " 🛡" : "";
+				const left = th.fg("dim", ` ${model}`) + th.fg("muted", " · ") + th.fg("accent", "Maestro") + th.fg("dim", dmgStr);
+				const right = th.fg("dim", `[${bar}] ${Math.round(pct)}% `);
+				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(mid) - visibleWidth(right)));
+
+				return [truncateToWidth(left + mid + pad + right, width)];
+			},
+		}));
 	});
 
 	// ─── Tools ────────────────────────────────────────────────────────────
