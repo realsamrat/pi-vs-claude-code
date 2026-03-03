@@ -341,8 +341,8 @@ export default function (pi: ExtensionAPI) {
 	const sessionDir = join(cwd, ".pi", "agent-sessions", "maestro");
 	if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 
-	// State
-	const agents = loadAgents(cwd);
+	// State — agents are reloaded on each pipeline run so file changes take effect
+	let agents = loadAgents(cwd);
 	const damageRules = loadDamageRules(cwd);
 	let phases: PhaseState[] = [];
 	let pipelineActive = false;
@@ -456,13 +456,21 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// Pipeline-order for card display: mirrors the execution order
+	const PIPELINE_ORDER = ["scout", "planner", "builder", "reviewer", "tester", "playwright-tester", "committer"];
+
 	function updateWidget() {
 		if (!widgetCtx) return;
 
 		widgetCtx.ui.setWidget("maestro", (_tui: any, theme: any) => {
 			return {
 				render(width: number): string[] {
-					const cards = Array.from(agentCards.values());
+					// Sort by pipeline order; unknown agents go last
+					const allCards = Array.from(agentCards.values());
+					const cards = [
+						...PIPELINE_ORDER.map(n => allCards.find(c => c.def.name.toLowerCase() === n)).filter(Boolean) as AgentCardState[],
+						...allCards.filter(c => !PIPELINE_ORDER.includes(c.def.name.toLowerCase())),
+					];
 					if (cards.length === 0) {
 						return ["", theme.fg("dim", "  No agents found in .pi/agents/maestro/")];
 					}
@@ -603,6 +611,9 @@ export default function (pi: ExtensionAPI) {
 
 		const model = getModel(ctx);
 		pipelineActive = true;
+
+		// Reload agents from disk so tool changes take effect without restarting Pi
+		agents = loadAgents(cwd);
 
 		// Reset all agent cards to idle for the new run
 		initAgentCards();
@@ -999,6 +1010,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_id, params, _signal, onUpdate, ctx) {
 			const { agent, task } = params as { agent: string; task: string };
+			agents = loadAgents(cwd); // reload so tool changes take effect without restarting Pi
 			const def = agents.get(agent.toLowerCase());
 			if (!def) {
 				return {
