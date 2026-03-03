@@ -28,7 +28,7 @@
  *         just ext-maestro
  */
 
-import type { ExtensionAPI, ToolCallEvent } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
@@ -311,7 +311,6 @@ function runAgentProcess(
 // ─── Main Extension ───────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	const theme = applyExtensionDefaults(pi, import.meta.url);
 	const cwd = process.cwd();
 
 	// Directories
@@ -328,34 +327,34 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── Damage Control Intercept ──────────────────────────────────────────
 
-	pi.on("tool_call", async (event: ToolCallEvent, _ctx) => {
-		if (!isToolCallEventType(event, "bash")) return;
+	pi.on("tool_call", async (event, _ctx) => {
+		if (!isToolCallEventType("bash", event)) return;
 
-		const command = (event.toolCall.arguments as any).command as string ?? "";
+		const command = (event.input as any).command as string ?? "";
 
 		// Check bash patterns
 		const bashCheck = checkBashCommand(command, damageRules);
 		if (bashCheck.blocked) {
 			return {
-				blocked: true,
+				block: true,
 				reason: `🛡 Maestro blocked: ${bashCheck.reason}\nCommand: ${command}`,
 			};
 		}
 
 		// Check path rules
-		const pathBlock = checkPathAccess("bash", event.toolCall.arguments as any, damageRules);
+		const pathBlock = checkPathAccess("bash", event.input as any, damageRules);
 		if (pathBlock) {
-			return { blocked: true, reason: `🛡 Maestro blocked: ${pathBlock}` };
+			return { block: true, reason: `🛡 Maestro blocked: ${pathBlock}` };
 		}
 	});
 
-	pi.on("tool_call", async (event: ToolCallEvent, _ctx) => {
-		if (isToolCallEventType(event, "bash")) return;
-		const toolName = event.toolCall.name;
-		const args = event.toolCall.arguments as Record<string, unknown>;
+	pi.on("tool_call", async (event, _ctx) => {
+		if (isToolCallEventType("bash", event)) return;
+		const toolName = (event as any).toolName ?? "";
+		const args = (event as any).input ?? {};
 		const pathBlock = checkPathAccess(toolName, args, damageRules);
 		if (pathBlock) {
-			return { blocked: true, reason: `🛡 Maestro blocked: ${pathBlock}` };
+			return { block: true, reason: `🛡 Maestro blocked: ${pathBlock}` };
 		}
 	});
 
@@ -801,8 +800,12 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── Session Start ─────────────────────────────────────────────────────
 
-	pi.on("session_start", (ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
+		applyExtensionDefaults(import.meta.url, ctx);
 		widgetCtx = ctx;
+
+		// Lock down to orchestrator-only tools
+		pi.setActiveTools(["run_pipeline", "dispatch_agent", "commit_and_pr"]);
 
 		// Footer: model + damage control indicator + phase status
 		ctx.ui.setFooter((_tui: any, th: any, width: number) => {
@@ -1022,11 +1025,13 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── Orchestrator System Prompt ────────────────────────────────────────
 
-	const agentList = Array.from(agents.values())
-		.map((a) => `  - ${a.name}: ${a.description}`)
-		.join("\n");
+	pi.on("before_agent_start", async (_event, _ctx) => {
+		const agentList = Array.from(agents.values())
+			.map((a) => `  - ${a.name}: ${a.description}`)
+			.join("\n");
 
-	pi.setSystemPrompt(`You are the Maestro Orchestrator — the primary agent for this session.
+		return {
+			systemPrompt: `You are the Maestro Orchestrator — the primary agent for this session.
 
 Your role is to understand what the user wants and delegate ALL work to specialist agents.
 You do NOT write code, run tests, or make file changes yourself.
@@ -1062,8 +1067,7 @@ Damage control rules are active. Dangerous bash commands and protected paths are
 
 ## Starting a session
 Greet the user briefly, confirm you're ready, and ask what they want to build.
-Do NOT run the pipeline automatically — wait for the user's task description.`);
-
-	// Restrict orchestrator to only its three tools (no direct bash/edit/etc)
-	pi.setActiveTools(["run_pipeline", "dispatch_agent", "commit_and_pr"]);
+Do NOT run the pipeline automatically — wait for the user's task description.`,
+		};
+	});
 }
