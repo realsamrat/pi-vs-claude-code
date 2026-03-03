@@ -380,14 +380,18 @@ export default function (pi: ExtensionAPI) {
 	function updateWidget() {
 		if (!widgetCtx || phases.length === 0) return;
 
-		const text = new Text("", 0, 0);
 		widgetCtx.ui.setWidget("maestro", (_tui: any, th: any) => {
-			return {
-				render(width: number) {
-					if (phases.length === 0) return "";
+			const text = new Text("", 0, 1);
 
-					const rows: string[] = [];
+			return {
+				render(width: number): string[] {
+					if (phases.length === 0) {
+						text.setText("");
+						return text.render(width);
+					}
+
 					const colW = [14, 22, 10, 10, 8];
+					const rows: string[] = [];
 
 					// Header
 					const header = [
@@ -412,36 +416,28 @@ export default function (pi: ExtensionAPI) {
 
 						const col0 = truncateToWidth(p.label, colW[0]).padEnd(colW[0]);
 						const col1 = truncateToWidth(p.agentNames.join(", "), colW[1]).padEnd(colW[1]);
-						const col2 = truncateToWidth(
-							`${icon} ${p.status}`, colW[2],
-						).padEnd(colW[2]);
-						const col3 = (p.maxRetries > 0
-							? `${p.retries}/${p.maxRetries}`
-							: "").padEnd(colW[3]);
+						const col2 = truncateToWidth(`${icon} ${p.status}`, colW[2]).padEnd(colW[2]);
+						const col3 = (p.maxRetries > 0 ? `${p.retries}/${p.maxRetries}` : "").padEnd(colW[3]);
 						const col4 = formatElapsed(p.elapsed).padEnd(colW[4]);
 
-						let row = th.fg(iconColor, col0) + "  " +
+						rows.push(
+							th.fg(iconColor, col0) + "  " +
 							th.fg("muted", col1) + "  " +
 							th.fg(iconColor, col2) + "  " +
 							th.fg("dim", col3) + "  " +
-							th.fg("dim", col4);
+							th.fg("dim", col4),
+						);
 
-						// Show rejection reason inline
 						if (p.status === "rejected" && p.rejectionReason) {
-							const reason = truncateToWidth(`  ↳ ${p.rejectionReason}`, width - 2);
-							row += "\n" + th.fg("warning", reason);
+							rows.push(th.fg("warning", truncateToWidth(`  ↳ ${p.rejectionReason}`, width - 2)));
 						}
-
-						// Show last work for running phase
 						if (p.status === "running" && p.lastWork) {
-							const work = truncateToWidth(`  › ${p.lastWork}`, width - 2);
-							row += "\n" + th.fg("dim", work);
+							rows.push(th.fg("dim", truncateToWidth(`  › ${p.lastWork}`, width - 2)));
 						}
-
-						rows.push(row);
 					}
 
-					return rows.join("\n");
+					text.setText(rows.join("\n"));
+					return text.render(width);
 				},
 				invalidate() {
 					text.invalidate();
