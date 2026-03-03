@@ -4,5 +4,6 @@
     "../.claude/commands"
   ],
   "defaultProvider": "claude-cli",
-  "defaultModel": "claude-sonnet-4-6"
+  "defaultModel": "claude-sonnet-4-6",
+  "quietStartup": true
 }
