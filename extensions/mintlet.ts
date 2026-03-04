@@ -1,5 +1,5 @@
 /**
- * Maestro — Blueprint-style conditional pipeline orchestrator
+ * Mintlet — Blueprint-style conditional pipeline orchestrator
  *
  * Inspired by Stripe's Minions "Blueprints": hybrid state machines that combine
  * deterministic nodes (linting, running tests, git ops) with agentic nodes
@@ -37,9 +37,9 @@
  *
  * Commands:
  *   /pipeline     — show current pipeline status
- *   /agents       — list loaded maestro agents
+ *   /agents       — list loaded mintlet agents
  *
- * Usage:  pi -e extensions/maestro.ts   (or just `pi` if globally loaded)
+ * Usage:  pi -e extensions/mintlet.ts   (or just `pi` if globally loaded)
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -408,22 +408,22 @@ function runDeterministicNode(
 // ─── Agent Loading ────────────────────────────────────────────────────────────
 
 // Directory containing this extension file — used as fallback agent location
-// when running maestro from a project that has no local .pi/agents/maestro/
+// when running mintlet from a project that has no local .pi/agents/mintlet/
 const EXTENSION_REPO_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
 function loadAgents(cwd: string): Map<string, AgentDef> {
 	const agents = new Map<string, AgentDef>();
 	// Prefer local project agents; fall back to the extension repo's own agents
-	const localDir = join(cwd, ".pi", "agents", "maestro");
-	const globalDir = join(EXTENSION_REPO_DIR, ".pi", "agents", "maestro");
-	const maestroDir = existsSync(localDir) ? localDir : globalDir;
+	const localDir = join(cwd, ".pi", "agents", "mintlet");
+	const globalDir = join(EXTENSION_REPO_DIR, ".pi", "agents", "mintlet");
+	const mintletDir = existsSync(localDir) ? localDir : globalDir;
 
-	if (!existsSync(maestroDir)) return agents;
+	if (!existsSync(mintletDir)) return agents;
 
-	for (const file of readdirSync(maestroDir)) {
+	for (const file of readdirSync(mintletDir)) {
 		if (!file.endsWith(".md")) continue;
 		try {
-			const raw = readFileSync(join(maestroDir, file), "utf-8");
+			const raw = readFileSync(join(mintletDir, file), "utf-8");
 			const match = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
 			if (!match) continue;
 			const fm: Record<string, string> = {};
@@ -524,7 +524,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Sessions always live under the current project's .pi/ so each project
 	// has its own agent memory even when the extension is loaded globally
-	const sessionDir = join(cwd, ".pi", "agent-sessions", "maestro");
+	const sessionDir = join(cwd, ".pi", "agent-sessions", "mintlet");
 	if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 
 	// State — agents are reloaded on each pipeline run so file changes take effect
@@ -547,13 +547,13 @@ export default function (pi: ExtensionAPI) {
 		if (bashCheck.blocked) {
 			return {
 				block: true,
-				reason: `🛡 Maestro blocked: ${bashCheck.reason}\nCommand: ${command}`,
+				reason: `🛡 Mintlet blocked: ${bashCheck.reason}\nCommand: ${command}`,
 			};
 		}
 
 		const pathBlock = checkPathAccess("bash", event.input as any, damageRules);
 		if (pathBlock) {
-			return { block: true, reason: `🛡 Maestro blocked: ${pathBlock}` };
+			return { block: true, reason: `🛡 Mintlet blocked: ${pathBlock}` };
 		}
 	});
 
@@ -563,7 +563,7 @@ export default function (pi: ExtensionAPI) {
 		const args = (event as any).input ?? {};
 		const pathBlock = checkPathAccess(toolName, args, damageRules);
 		if (pathBlock) {
-			return { block: true, reason: `🛡 Maestro blocked: ${pathBlock}` };
+			return { block: true, reason: `🛡 Mintlet blocked: ${pathBlock}` };
 		}
 	});
 
@@ -646,7 +646,7 @@ export default function (pi: ExtensionAPI) {
 	function updateWidget() {
 		if (!widgetCtx) return;
 
-		widgetCtx.ui.setWidget("maestro", (_tui: any, theme: any) => {
+		widgetCtx.ui.setWidget("mintlet", (_tui: any, theme: any) => {
 			return {
 				render(width: number): string[] {
 					// Sort agent cards by pipeline order; unknown agents go last
@@ -661,7 +661,7 @@ export default function (pi: ExtensionAPI) {
 					const lines: string[] = [""];
 
 					if (cards.length === 0) {
-						lines.push(theme.fg("dim", "  No agents found in .pi/agents/maestro/"));
+						lines.push(theme.fg("dim", "  No agents found in .pi/agents/mintlet/"));
 					} else {
 						const cols = Math.min(3, cards.length);
 						const gap = 1;
@@ -774,7 +774,7 @@ export default function (pi: ExtensionAPI) {
 		agentCwd?: string,
 	): Promise<string[]> {
 		const def = agents.get(agentName.toLowerCase());
-		if (!def) throw new Error(`Agent "${agentName}" not found in .pi/agents/maestro/`);
+		if (!def) throw new Error(`Agent "${agentName}" not found in .pi/agents/mintlet/`);
 
 		phaseState.status = "running";
 		phaseState.agentNames = count === 1
@@ -1248,7 +1248,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
-		if (widgetCtx) widgetCtx.ui.setWidget("maestro", undefined);
+		if (widgetCtx) widgetCtx.ui.setWidget("mintlet", undefined);
 		widgetCtx = ctx;
 
 		// Lock down to orchestrator-only tools
@@ -1258,12 +1258,12 @@ export default function (pi: ExtensionAPI) {
 
 		const agentCount = agents.size;
 		const dmgActive = Object.keys(damageRules).length > 0;
-		ctx.ui.setStatus("maestro", `Maestro (${agentCount} agents${dmgActive ? " · 🛡" : ""})`);
+		ctx.ui.setStatus("mintlet", `Mintlet (${agentCount} agents${dmgActive ? " · 🛡" : ""})`);
 
 		updateWidget();
 
 		ctx.ui.notify(
-			`Maestro loaded — ${agentCount} agents ready\n\n` +
+			`Mintlet loaded — ${agentCount} agents ready\n\n` +
 			`Pipeline: Context → Scout → Plan → [Worktree] → Build → [Lint] → Review → [Tests] → Test Gate → Commit+PR\n` +
 			`• [Lint] and [Tests] are deterministic nodes — auto-detected, no LLM needed\n` +
 			`• Lint failures trigger agentic lint-fix; CI failures trigger agentic CI-fix\n` +
@@ -1293,7 +1293,7 @@ export default function (pi: ExtensionAPI) {
 					: "";
 
 				const dmgStr = dmgActive ? " 🛡" : "";
-				const left = th.fg("dim", ` ${model}`) + th.fg("muted", " · ") + th.fg("accent", "Maestro") + th.fg("dim", dmgStr);
+				const left = th.fg("dim", ` ${model}`) + th.fg("muted", " · ") + th.fg("accent", "Mintlet") + th.fg("dim", dmgStr);
 				const right = th.fg("dim", `[${bar}] ${Math.round(pct)}% `);
 				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(mid) - visibleWidth(right)));
 
@@ -1308,7 +1308,7 @@ export default function (pi: ExtensionAPI) {
 		name: "run_pipeline",
 		label: "Run Pipeline",
 		description:
-			"Execute the Maestro blueprint pipeline: Context → Scout → Plan → [Worktree] → Build → [Lint] → Review → [Tests] → Test Gate → Commit+PR. " +
+			"Execute the Mintlet blueprint pipeline: Context → Scout → Plan → [Worktree] → Build → [Lint] → Review → [Tests] → Test Gate → Commit+PR. " +
 			"Deterministic lint/test nodes run directly (no LLM). Failures trigger agentic fix passes. " +
 			"All build/review/test work runs in an isolated git worktree branch.",
 		parameters: Type.Object({
@@ -1327,7 +1327,7 @@ export default function (pi: ExtensionAPI) {
 			const p = params as any;
 			if (onUpdate) {
 				onUpdate({
-					content: [{ type: "text", text: `Starting Maestro pipeline: ${p.task.slice(0, 80)}...` }],
+					content: [{ type: "text", text: `Starting Mintlet pipeline: ${p.task.slice(0, 80)}...` }],
 					details: { status: "running" },
 				});
 			}
@@ -1378,7 +1378,7 @@ export default function (pi: ExtensionAPI) {
 		name: "dispatch_agent",
 		label: "Dispatch Agent",
 		description:
-			"Dispatch a single Maestro agent for a focused ad-hoc task (outside the full pipeline). " +
+			"Dispatch a single Mintlet agent for a focused ad-hoc task (outside the full pipeline). " +
 			"Available: " + Array.from(agents.keys()).join(", "),
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name (scout, planner, builder, reviewer, tester, committer)" }),
@@ -1448,7 +1448,7 @@ export default function (pi: ExtensionAPI) {
 			const def = agents.get("committer");
 			if (!def) {
 				return {
-					content: [{ type: "text", text: "Committer agent not found in .pi/agents/maestro/" }],
+					content: [{ type: "text", text: "Committer agent not found in .pi/agents/mintlet/" }],
 					details: {},
 				};
 			}
@@ -1497,7 +1497,7 @@ export default function (pi: ExtensionAPI) {
 			const list = Array.from(agents.values())
 				.map((a) => `  ${displayName(a.name).padEnd(20)} ${a.description}`)
 				.join("\n");
-			ctx.ui.notify(`Maestro agents:\n${list || "(none found in .pi/agents/maestro/)"}`, "info");
+			ctx.ui.notify(`Mintlet agents:\n${list || "(none found in .pi/agents/mintlet/)"}`, "info");
 			return { handled: true };
 		}
 	});
@@ -1510,7 +1510,7 @@ export default function (pi: ExtensionAPI) {
 			.join("\n");
 
 		return {
-			systemPrompt: `You are the Maestro Orchestrator — the primary agent for this session.
+			systemPrompt: `You are the Mintlet Orchestrator — the primary agent for this session.
 
 Your role is to understand what the user wants and delegate ALL work to specialist agents.
 You do NOT write code, run tests, or make file changes yourself.
