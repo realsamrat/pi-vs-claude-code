@@ -1,21 +1,36 @@
 /**
- * Maestro — All-in-one conditional pipeline orchestrator
+ * Maestro — Blueprint-style conditional pipeline orchestrator
  *
- * Merges: damage control, task tracking (tilldone-style), multi-agent
- * dispatch (agent-team-style), and a conditional pipeline with
- * APPROVED/REJECTED gates and automatic retry/rerouting.
+ * Inspired by Stripe's Minions "Blueprints": hybrid state machines that combine
+ * deterministic nodes (linting, running tests, git ops) with agentic nodes
+ * (implementing, reviewing, fixing CI failures).
  *
- * Pipeline: Scout(s) → Planner → Builder(s) → Review Gate → Test Gate → Commit
+ * Pipeline:
+ *   [Context]  — deterministic: gather git log, README, package.json
+ *   Scout(s)   — agentic: explore codebase (read-only, main repo)
+ *   Planner    — agentic: produce implementation plan
+ *   [Worktree] — deterministic: create isolated git worktree branch
+ *   Builder(s) — agentic: implement the plan (runs in worktree)
+ *   [Lint]     — deterministic: run linter (auto-detected); if fails → agentic lint-fix
+ *   Reviewer(s)— agentic: code review gate (APPROVED/REJECTED)
+ *   [Tests]    — deterministic: run test suite; if fails → agentic CI-fix
+ *   Test Gate  — agentic: interpret test results (APPROVED/REJECTED)
+ *   Playwright — agentic: browser tests (auto-spawned if flagged)
+ *   Committer  — agentic: commit + push branch + open PR to main
+ *   [Cleanup]  — deterministic: remove worktree
  *
- *   Review gate: REJECTED → retry builders (up to 3×)
- *   Test gate:   REJECTED → retry from review (up to 2×)
- *   Playwright:  auto-spawned when tester output flags browser testing
+ * Review gate loops back on REJECTED (up to 3×).
+ * Test gate loops back on REJECTED (up to 2×).
  *
  * All features:
- *   ✓ Damage control  (bash safety rules from damage-control-rules.yaml)
- *   ✓ Task tracking   (live phase widget with status + retry counts)
+ *   ✓ Damage control  (bash safety rules from .pi/damage-control-rules.yaml)
+ *   ✓ Pre-context hydration before scout
+ *   ✓ Git worktree sandboxing (isolated branch per run)
+ *   ✓ Deterministic lint + test nodes (no LLM waste for mechanical checks)
+ *   ✓ Agentic lint-fix and CI-fix passes
+ *   ✓ Task tracking   (live phase widget + footer)
  *   ✓ Parallel agents (multiple scouts, builders, reviewers, testers)
- *   ✓ Conditional routing (APPROVED / REJECTED gates between phases)
+ *   ✓ Conditional routing (APPROVED/REJECTED gates)
  *   ✓ Playwright auto-detection
  *   ✓ Commit + PR automation
  *   ✓ Primary orchestrator (delegates everything — never codes itself)
@@ -24,17 +39,17 @@
  *   /pipeline     — show current pipeline status
  *   /agents       — list loaded maestro agents
  *
- * Usage:  pi -e extensions/maestro.ts
- *         just ext-maestro
+ * Usage:  pi -e extensions/maestro.ts   (or just `pi` if globally loaded)
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
+import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { parse as yamlParse } from "yaml";
 import { applyExtensionDefaults } from "./themeMap.ts";
@@ -108,6 +123,9 @@ interface RunOptions {
 	skipCommit?: boolean;
 	maxReviewRetries?: number;
 	maxTestRetries?: number;
+	lintCommand?: string;    // override auto-detected lint command
+	testCommand?: string;    // override auto-detected test command
+	useWorktree?: boolean;   // create isolated git worktree (default: true)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -119,6 +137,15 @@ function displayName(name: string): string {
 		.join(" ");
 }
 
+function statusIcon(s: PhaseStatus): string {
+	return s === "pending" ? "○"
+		: s === "running" ? "◉"
+		: s === "done" ? "✓"
+		: s === "rejected" ? "✗"
+		: s === "error" ? "✗"
+		: s === "skipped" ? "─" : "?";
+}
+
 /** Parse APPROVED / REJECTED: <reason> from the tail of agent output */
 function parseDecision(output: string): { approved: boolean; reason: string } {
 	const lines = output.trim().split("\n").reverse();
@@ -128,17 +155,14 @@ function parseDecision(output: string): { approved: boolean; reason: string } {
 		if (/^APPROVED$/i.test(t)) return { approved: true, reason: "" };
 		const rej = t.match(/^REJECTED:\s*(.+)$/i);
 		if (rej) return { approved: false, reason: rej[1] };
-		// Stop scanning after non-empty non-decision line near end
 		break;
 	}
-	// Scan further back for the decision line
 	for (const line of lines) {
 		const t = line.trim();
 		if (/^APPROVED$/i.test(t)) return { approved: true, reason: "" };
 		const rej = t.match(/^REJECTED:\s*(.+)$/i);
 		if (rej) return { approved: false, reason: rej[1] };
 	}
-	// Default: assume approved if no explicit decision found
 	return { approved: true, reason: "" };
 }
 
@@ -230,6 +254,157 @@ function checkPathAccess(
 	return null;
 }
 
+// ─── Context Hydration ────────────────────────────────────────────────────────
+
+/** Gather repo context deterministically before running scout agents */
+function gatherContext(cwd: string): string {
+	const parts: string[] = [];
+
+	// Git info
+	try {
+		const branch = execSync("git branch --show-current", { cwd, encoding: "utf-8" }).trim();
+		const log = execSync("git log --oneline -10", { cwd, encoding: "utf-8" });
+		const status = execSync("git status --short", { cwd, encoding: "utf-8" });
+		parts.push(
+			`## Git\nBranch: ${branch}\n\nRecent commits:\n${log.trim()}\n\nWorking tree:\n${status.trim() || "(clean)"}`,
+		);
+	} catch {}
+
+	// README
+	for (const name of ["README.md", "README.txt", "readme.md"]) {
+		try {
+			const content = readFileSync(join(cwd, name), "utf-8");
+			parts.push(
+				`## ${name}\n${content.slice(0, 2000)}${content.length > 2000 ? "\n…(truncated)" : ""}`,
+			);
+			break;
+		} catch {}
+	}
+
+	// package.json
+	try {
+		const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf-8"));
+		parts.push(
+			`## package.json\n${JSON.stringify({ name: pkg.name, description: pkg.description, scripts: pkg.scripts }, null, 2)}`,
+		);
+	} catch {}
+
+	return parts.length > 0 ? parts.join("\n\n---\n\n") : "";
+}
+
+/** Auto-detect lint command from project files */
+function detectLintCommand(cwd: string): string | null {
+	try {
+		const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf-8"));
+		const s = pkg.scripts ?? {};
+		if (s.lint) return "bun run lint";
+		if (s["lint:check"]) return "bun run lint:check";
+		if (s["type-check"]) return "bun run type-check";
+	} catch {}
+	if (existsSync(join(cwd, "biome.json")) || existsSync(join(cwd, "biome.jsonc"))) {
+		return "bunx biome check .";
+	}
+	if (
+		existsSync(join(cwd, ".eslintrc")) ||
+		existsSync(join(cwd, ".eslintrc.json")) ||
+		existsSync(join(cwd, ".eslintrc.js")) ||
+		existsSync(join(cwd, "eslint.config.js")) ||
+		existsSync(join(cwd, "eslint.config.mjs"))
+	) {
+		return "bunx eslint .";
+	}
+	return null;
+}
+
+/** Auto-detect test command from project files */
+function detectTestCommand(cwd: string): string | null {
+	try {
+		const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf-8"));
+		const s = pkg.scripts ?? {};
+		if (s.test && !s.test.includes("no test")) {
+			const hasBunLock = existsSync(join(cwd, "bun.lock")) || existsSync(join(cwd, "bun.lockb"));
+			return hasBunLock ? "bun test" : "npm test";
+		}
+		if (s["test:run"]) return "bun run test:run";
+		if (s["test:ci"]) return "bun run test:ci";
+	} catch {}
+	if (existsSync(join(cwd, "pytest.ini")) || existsSync(join(cwd, "pyproject.toml"))) {
+		return "pytest --tb=short";
+	}
+	return null;
+}
+
+// ─── Worktree Sandbox ─────────────────────────────────────────────────────────
+
+/** Create an isolated git worktree branch for a pipeline run */
+function createWorktree(
+	cwd: string,
+	runId: string,
+): { path: string; branch: string } | null {
+	const branch = `mintlet-run-${runId}`;
+	const worktreePath = join(tmpdir(), branch);
+	try {
+		execSync(`git worktree add -b "${branch}" "${worktreePath}" HEAD`, {
+			cwd,
+			stdio: "ignore",
+		});
+		return { path: worktreePath, branch };
+	} catch {
+		return null;
+	}
+}
+
+/** Remove a git worktree and its branch */
+function removeWorktree(cwd: string, worktreePath: string, branch: string): void {
+	try {
+		execSync(`git worktree remove --force "${worktreePath}"`, { cwd, stdio: "ignore" });
+	} catch {}
+	try {
+		execSync(`git branch -D "${branch}"`, { cwd, stdio: "ignore" });
+	} catch {}
+}
+
+// ─── Deterministic Node Runner ────────────────────────────────────────────────
+
+/** Run a shell command directly (no LLM). Returns stdout+stderr, success flag, duration. */
+function runDeterministicNode(
+	command: string,
+	nodeCwd: string,
+	onProgress: (line: string) => void,
+): Promise<{ success: boolean; output: string; duration: number }> {
+	const start = Date.now();
+	return new Promise((resolve) => {
+		const proc = spawn("sh", ["-c", command], {
+			cwd: nodeCwd,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		const lines: string[] = [];
+		const onData = (buf: Buffer) => {
+			for (const line of buf.toString().split("\n")) {
+				if (line.trim()) {
+					lines.push(line);
+					onProgress(line);
+				}
+			}
+		};
+
+		proc.stdout!.on("data", onData);
+		proc.stderr!.on("data", onData);
+
+		proc.on("close", (code) => {
+			resolve({
+				success: (code ?? 1) === 0,
+				output: lines.join("\n"),
+				duration: Date.now() - start,
+			});
+		});
+		proc.on("error", (err) => {
+			resolve({ success: false, output: err.message, duration: Date.now() - start });
+		});
+	});
+}
+
 // ─── Agent Loading ────────────────────────────────────────────────────────────
 
 // Directory containing this extension file — used as fallback agent location
@@ -239,7 +414,7 @@ const EXTENSION_REPO_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 function loadAgents(cwd: string): Map<string, AgentDef> {
 	const agents = new Map<string, AgentDef>();
 	// Prefer local project agents; fall back to the extension repo's own agents
-	const localDir  = join(cwd, ".pi", "agents", "maestro");
+	const localDir = join(cwd, ".pi", "agents", "maestro");
 	const globalDir = join(EXTENSION_REPO_DIR, ".pi", "agents", "maestro");
 	const maestroDir = existsSync(localDir) ? localDir : globalDir;
 
@@ -277,6 +452,7 @@ function runAgentProcess(
 	sessionFile: string,
 	resumeSession: boolean,
 	onProgress: (line: string) => void,
+	agentCwd?: string,
 ): Promise<{ output: string; exitCode: number; elapsed: number }> {
 	const args = [
 		"--mode", "json",
@@ -298,6 +474,7 @@ function runAgentProcess(
 		const proc = spawn("pi", args, {
 			stdio: ["ignore", "pipe", "pipe"],
 			env: { ...process.env },
+			cwd: agentCwd,
 		});
 
 		let buffer = "";
@@ -366,7 +543,6 @@ export default function (pi: ExtensionAPI) {
 
 		const command = (event.input as any).command as string ?? "";
 
-		// Check bash patterns
 		const bashCheck = checkBashCommand(command, damageRules);
 		if (bashCheck.blocked) {
 			return {
@@ -375,7 +551,6 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 
-		// Check path rules
 		const pathBlock = checkPathAccess("bash", event.input as any, damageRules);
 		if (pathBlock) {
 			return { block: true, reason: `🛡 Maestro blocked: ${pathBlock}` };
@@ -407,7 +582,7 @@ export default function (pi: ExtensionAPI) {
 		const statusCol = state.status === "idle" ? "dim"
 			: state.status === "running" ? "accent"
 			: state.status === "done" ? "success" : "error";
-		const statusIcon = state.status === "idle" ? "○"
+		const statusIco = state.status === "idle" ? "○"
 			: state.status === "running" ? "◉"
 			: state.status === "done" ? "✓" : "✗";
 
@@ -417,7 +592,7 @@ export default function (pi: ExtensionAPI) {
 
 		const timeStr = state.status !== "idle" ? ` ${Math.round(state.elapsed / 1000)}s` : "";
 		const queriesStr = state.queryCount > 0 ? ` (${state.queryCount})` : "";
-		const statusRaw = `${statusIcon} ${state.status}${timeStr}${queriesStr}`;
+		const statusRaw = `${statusIco} ${state.status}${timeStr}${queriesStr}`;
 		const statusLine = theme.fg(statusCol, statusRaw);
 		const statusVisible = statusRaw.length;
 
@@ -474,33 +649,56 @@ export default function (pi: ExtensionAPI) {
 		widgetCtx.ui.setWidget("maestro", (_tui: any, theme: any) => {
 			return {
 				render(width: number): string[] {
-					// Sort by pipeline order; unknown agents go last
+					// Sort agent cards by pipeline order; unknown agents go last
 					const allCards = Array.from(agentCards.values());
 					const cards = [
-						...PIPELINE_ORDER.map(n => allCards.find(c => c.def.name.toLowerCase() === n)).filter(Boolean) as AgentCardState[],
+						...PIPELINE_ORDER
+							.map(n => allCards.find(c => c.def.name.toLowerCase() === n))
+							.filter(Boolean) as AgentCardState[],
 						...allCards.filter(c => !PIPELINE_ORDER.includes(c.def.name.toLowerCase())),
 					];
-					if (cards.length === 0) {
-						return ["", theme.fg("dim", "  No agents found in .pi/agents/maestro/")];
-					}
-
-					const cols = Math.min(3, cards.length);
-					const gap = 1;
-					const colWidth = Math.floor((width - gap * (cols - 1)) / cols) - 1;
 
 					const lines: string[] = [""];
 
-					for (let i = 0; i < cards.length; i += cols) {
-						const row = cards.slice(i, i + cols);
-						const cardLines = row.map((c) => renderCard(c, colWidth, theme));
+					if (cards.length === 0) {
+						lines.push(theme.fg("dim", "  No agents found in .pi/agents/maestro/"));
+					} else {
+						const cols = Math.min(3, cards.length);
+						const gap = 1;
+						const colWidth = Math.floor((width - gap * (cols - 1)) / cols) - 1;
 
-						while (cardLines.length < cols) {
-							cardLines.push(Array(6).fill(" ".repeat(colWidth)));
+						for (let i = 0; i < cards.length; i += cols) {
+							const row = cards.slice(i, i + cols);
+							const cardLines = row.map((c) => renderCard(c, colWidth, theme));
+
+							while (cardLines.length < cols) {
+								cardLines.push(Array(6).fill(" ".repeat(colWidth)));
+							}
+
+							const height = cardLines[0].length;
+							for (let l = 0; l < height; l++) {
+								lines.push(cardLines.map((c) => c[l] ?? "").join(" ".repeat(gap)));
+							}
 						}
+					}
 
-						const height = cardLines[0].length;
-						for (let l = 0; l < height; l++) {
-							lines.push(cardLines.map((c) => c[l] ?? "").join(" ".repeat(gap)));
+					// Pipeline phase progress bar
+					if (phases.length > 0) {
+						lines.push("");
+						const phaseItems = phases.map((p) => {
+							const ico = statusIcon(p.status);
+							const col = p.status === "running" ? "accent"
+								: p.status === "done" ? "success"
+								: p.status === "error" || p.status === "rejected" ? "error"
+								: p.status === "skipped" ? "dim" : "dim";
+							const label = p.retries > 0 ? `${p.label}(${p.retries})` : p.label;
+							return theme.fg(col, `${ico} ${label}`);
+						});
+						// Wrap phases into rows of ~5
+						const rowSize = 5;
+						for (let i = 0; i < phaseItems.length; i += rowSize) {
+							const row = phaseItems.slice(i, i + rowSize);
+							lines.push("  " + row.join(theme.fg("dim", " → ")));
 						}
 					}
 
@@ -531,6 +729,7 @@ export default function (pi: ExtensionAPI) {
 		sessionKey: string,
 		phase: PhaseState,
 		model: string,
+		agentCwd?: string,
 	): Promise<{ output: string; exitCode: number }> {
 		const cardKey = def.name.toLowerCase();
 		const card = agentCards.get(cardKey);
@@ -544,7 +743,6 @@ export default function (pi: ExtensionAPI) {
 			card.queryCount++;
 		}
 
-		// Elapsed timer for card
 		const elapsedTimer = setInterval(() => {
 			if (card) { card.elapsed = Date.now() - startTime; updateWidget(); }
 		}, 1000);
@@ -555,7 +753,7 @@ export default function (pi: ExtensionAPI) {
 			if (card && line) { card.lastLine = line; }
 			phase.lastWork = line || phase.lastWork;
 			updateWidget();
-		});
+		}, agentCwd);
 
 		clearInterval(elapsedTimer);
 		if (card) {
@@ -573,6 +771,7 @@ export default function (pi: ExtensionAPI) {
 		tasks: string[],
 		phaseState: PhaseState,
 		model: string,
+		agentCwd?: string,
 	): Promise<string[]> {
 		const def = agents.get(agentName.toLowerCase());
 		if (!def) throw new Error(`Agent "${agentName}" not found in .pi/agents/maestro/`);
@@ -585,7 +784,7 @@ export default function (pi: ExtensionAPI) {
 		const promises = Array.from({ length: count }, (_, i) => {
 			const key = count === 1 ? agentName : `${agentName}-${i}`;
 			const task = tasks[i] ?? tasks[0];
-			return runAgent(def, task, key, phaseState, model);
+			return runAgent(def, task, key, phaseState, model, agentCwd);
 		});
 
 		const results = await Promise.all(promises);
@@ -616,6 +815,9 @@ export default function (pi: ExtensionAPI) {
 			skipCommit = false,
 			maxReviewRetries = 3,
 			maxTestRetries = 2,
+			lintCommand: lintCmdOverride,
+			testCommand: testCmdOverride,
+			useWorktree = true,
 		} = opts;
 
 		const model = getModel(ctx);
@@ -627,42 +829,41 @@ export default function (pi: ExtensionAPI) {
 		// Reset all agent cards to idle for the new run
 		initAgentCards();
 
+		// Auto-detect lint/test commands
+		const resolvedLintCmd = lintCmdOverride ?? detectLintCommand(cwd);
+		const resolvedTestCmd = testCmdOverride ?? detectTestCommand(cwd);
+
 		// ── Initialise phase list ──────────────────────────────────────────
-		phases = [
-			{
-				name: "scout", label: "Scout", agentNames: [],
-				status: "pending", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "",
-			},
-			{
-				name: "plan", label: "Plan", agentNames: [],
-				status: "pending", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "",
-			},
-			{
-				name: "build", label: "Build", agentNames: [],
-				status: "pending", retries: 0, maxRetries: maxReviewRetries, elapsed: 0, lastWork: "",
-			},
-			{
-				name: "review", label: "Review Gate", agentNames: [],
-				status: "pending", retries: 0, maxRetries: maxReviewRetries, elapsed: 0, lastWork: "",
-			},
-			{
-				name: "test", label: "Test Gate", agentNames: [],
-				status: "pending", retries: 0, maxRetries: maxTestRetries, elapsed: 0, lastWork: "",
-			},
-			{
-				name: "commit", label: "Commit + PR", agentNames: [],
-				status: skipCommit ? "skipped" : "pending",
-				retries: 0, maxRetries: 0, elapsed: 0, lastWork: "",
-			},
+		const phaseList: PhaseState[] = [
+			{ name: "context",  label: "Context",    agentNames: [], status: "pending", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "" },
+			{ name: "scout",    label: "Scout",      agentNames: [], status: "pending", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "" },
+			{ name: "plan",     label: "Plan",       agentNames: [], status: "pending", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "" },
+			{ name: "worktree", label: "Worktree",   agentNames: [], status: useWorktree ? "pending" : "skipped", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "" },
+			{ name: "build",    label: "Build",      agentNames: [], status: "pending", retries: 0, maxRetries: maxReviewRetries, elapsed: 0, lastWork: "" },
 		];
+		if (resolvedLintCmd) {
+			phaseList.push({ name: "lint", label: "Lint", agentNames: [], status: "pending", retries: 0, maxRetries: 1, elapsed: 0, lastWork: "" });
+		}
+		phaseList.push(
+			{ name: "review",   label: "Review",     agentNames: [], status: "pending", retries: 0, maxRetries: maxReviewRetries, elapsed: 0, lastWork: "" },
+		);
+		if (resolvedTestCmd) {
+			phaseList.push({ name: "run-tests", label: "Run Tests", agentNames: [], status: "pending", retries: 0, maxRetries: maxTestRetries, elapsed: 0, lastWork: "" });
+		}
+		phaseList.push(
+			{ name: "test",   label: "Test Gate", agentNames: [], status: "pending", retries: 0, maxRetries: maxTestRetries, elapsed: 0, lastWork: "" },
+			{ name: "commit", label: "Commit+PR",  agentNames: [], status: skipCommit ? "skipped" : "pending", retries: 0, maxRetries: 0, elapsed: 0, lastWork: "" },
+		);
+		phases = phaseList;
 		updateWidget();
 
-		const phaseOf = (name: string) => phases.find((p) => p.name === name)!;
+		const phaseOf = (name: string): PhaseState | undefined => phases.find((p) => p.name === name);
 
 		// Phase timers
 		const timers = new Map<string, ReturnType<typeof setInterval>>();
 		function startTimer(name: string) {
 			const p = phaseOf(name);
+			if (!p) return;
 			const t0 = Date.now();
 			timers.set(name, setInterval(() => { p.elapsed = Date.now() - t0; updateWidget(); }, 1000));
 		}
@@ -671,12 +872,25 @@ export default function (pi: ExtensionAPI) {
 			timers.delete(name);
 		}
 
+		let worktreeInfo: { path: string; branch: string } | null = null;
+
 		try {
+			// ── Phase 0: Gather context (deterministic) ────────────────────
+			const contextPhase = phaseOf("context")!;
+			contextPhase.status = "running";
+			contextPhase.lastWork = "Gathering git log, README, package.json…";
+			updateWidget();
+			const repoContext = gatherContext(cwd);
+			contextPhase.status = "done";
+			contextPhase.lastWork = repoContext ? "Context ready" : "No context (not a git repo?)";
+			updateWidget();
+
 			// ── Phase 1: Scout ─────────────────────────────────────────────
 			startTimer("scout");
+			const contextPrefix = repoContext ? `## Repository Context\n${repoContext}\n\n` : "";
 			const scoutTasks = Array.from({ length: scouts }, () =>
-				`Task: ${task}\n\nExplore the codebase to understand what needs to change.`);
-			const scoutOutputs = await runPhaseAgents("scout", scouts, scoutTasks, phaseOf("scout"), model);
+				`${contextPrefix}## Task\n${task}\n\nExplore the codebase to understand what needs to change. Focus on relevant files, existing patterns, and potential impact areas.`);
+			const scoutOutputs = await runPhaseAgents("scout", scouts, scoutTasks, phaseOf("scout")!, model);
 			const scoutReport = mergeOutputs(scoutOutputs, scoutOutputs.map((_, i) => `Scout ${i + 1}`));
 			stopTimer("scout");
 
@@ -684,65 +898,134 @@ export default function (pi: ExtensionAPI) {
 			startTimer("plan");
 			const planOutputs = await runPhaseAgents(
 				"planner", 1,
-				[`Task: ${task}\n\nScout findings:\n${scoutReport}\n\nCreate a precise implementation plan.`],
-				phaseOf("plan"), model,
+				[`## Task\n${task}\n\n## Scout Findings\n${scoutReport}\n\nCreate a precise, step-by-step implementation plan.`],
+				phaseOf("plan")!, model,
 			);
 			const plan = planOutputs[0];
 			stopTimer("plan");
 
-			// ── Phase 3+4: Build → Review loop ────────────────────────────
+			// ── Worktree setup (deterministic) ─────────────────────────────
+			const wtPhase = phaseOf("worktree");
+			if (useWorktree && wtPhase) {
+				startTimer("worktree");
+				wtPhase.status = "running";
+				wtPhase.lastWork = "Creating isolated branch…";
+				updateWidget();
+				const runId = Date.now().toString(36);
+				worktreeInfo = createWorktree(cwd, runId);
+				if (worktreeInfo) {
+					wtPhase.status = "done";
+					wtPhase.lastWork = `Branch: ${worktreeInfo.branch}`;
+				} else {
+					wtPhase.status = "skipped";
+					wtPhase.lastWork = "git worktree unavailable — using main repo";
+				}
+				stopTimer("worktree");
+				updateWidget();
+			}
+
+			const buildCwd = worktreeInfo?.path ?? cwd;
+
+			// ── Phase 3+4+5: Build → Lint → Review loop ───────────────────
 			let buildOutput = "";
 			let reviewFeedback = "";
 			let reviewApproved = false;
 
 			for (let attempt = 0; attempt <= maxReviewRetries; attempt++) {
 				// Build
-				phaseOf("build").status = "pending";
-				phaseOf("build").retries = attempt;
+				const buildPhase = phaseOf("build")!;
+				buildPhase.status = "pending";
+				buildPhase.retries = attempt;
 				startTimer("build");
 
 				const buildPrompt = attempt === 0
-					? `Task: ${task}\n\nPlan:\n${plan}\n\nImplement the plan.`
-					: `Task: ${task}\n\nPrevious implementation was rejected.\nReviewer feedback: ${reviewFeedback}\n\nPlan:\n${plan}\n\nFix all issues and re-implement.`;
+					? `## Task\n${task}\n\n## Plan\n${plan}\n\nImplement the plan. Work in the current directory.`
+					: `## Task\n${task}\n\n## Plan\n${plan}\n\n## Reviewer Feedback (fix these issues)\n${reviewFeedback}\n\nFix all issues and re-implement.`;
 
 				const buildOutputs = await runPhaseAgents(
 					"builder", builders,
 					Array.from({ length: builders }, () => buildPrompt),
-					phaseOf("build"), model,
+					buildPhase, model, buildCwd,
 				);
 				buildOutput = mergeOutputs(buildOutputs, buildOutputs.map((_, i) => `Builder ${i + 1}`));
 				stopTimer("build");
 
+				// Lint (deterministic, optional)
+				const lintPhase = phaseOf("lint");
+				if (resolvedLintCmd && lintPhase) {
+					lintPhase.status = "running";
+					lintPhase.retries = attempt;
+					startTimer("lint");
+
+					const lintResult = await runDeterministicNode(resolvedLintCmd, buildCwd, (line) => {
+						lintPhase.lastWork = line.slice(0, 120);
+						updateWidget();
+					});
+					stopTimer("lint");
+
+					if (!lintResult.success) {
+						lintPhase.status = "rejected";
+						lintPhase.lastWork = lintResult.output.split("\n").filter(Boolean).slice(-2).join(" | ");
+						updateWidget();
+
+						// One agentic lint-fix pass
+						const builderDef = agents.get("builder");
+						if (builderDef) {
+							const fixPhase: PhaseState = {
+								name: "lint-fix", label: "Lint Fix", agentNames: ["Builder"],
+								status: "running", retries: 0, maxRetries: 1, elapsed: 0, lastWork: "",
+							};
+							await runAgent(
+								builderDef,
+								`## Lint Errors\n${lintResult.output.slice(0, 4000)}\n\n## Task\n${task}\n\nFix ALL lint errors listed above.`,
+								`builder-lint-fix-${attempt}`,
+								fixPhase, model, buildCwd,
+							);
+							// Verify lint is fixed
+							const recheck = await runDeterministicNode(resolvedLintCmd, buildCwd, () => {});
+							lintPhase.status = recheck.success ? "done" : "error";
+							lintPhase.lastWork = recheck.success
+								? "✓ Lint fixed"
+								: recheck.output.split("\n").filter(Boolean).slice(-1)[0] ?? "Still failing";
+							updateWidget();
+						}
+					} else {
+						lintPhase.status = "done";
+						lintPhase.lastWork = "✓ No lint errors";
+						updateWidget();
+					}
+				}
+
 				// Review
-				phaseOf("review").status = "pending";
-				phaseOf("review").retries = attempt;
+				const reviewPhase = phaseOf("review")!;
+				reviewPhase.status = "pending";
+				reviewPhase.retries = attempt;
 				startTimer("review");
 
 				const reviewOutputs = await runPhaseAgents(
 					"reviewer", reviewers,
 					Array.from({ length: reviewers }, () =>
-						`Task: ${task}\n\nImplementation summary:\n${buildOutput}\n\nReview the changes in the codebase. End with APPROVED or REJECTED: <reason>.`),
-					phaseOf("review"), model,
+						`## Task\n${task}\n\n## Implementation Summary\n${buildOutput}\n\nReview the changes in the codebase. End with APPROVED or REJECTED: <reason>.`),
+					reviewPhase, model, buildCwd,
 				);
 				const reviewOutput = reviewOutputs[0];
-				const decision = parseDecision(reviewOutput);
+				const reviewDecision = parseDecision(reviewOutput);
 				stopTimer("review");
 
-				if (decision.approved) {
+				if (reviewDecision.approved) {
 					reviewApproved = true;
-					phaseOf("review").decision = "approved";
+					reviewPhase.decision = "approved";
 					break;
 				}
 
-				reviewFeedback = decision.reason;
-				phaseOf("review").status = "rejected";
-				phaseOf("review").decision = "rejected";
-				phaseOf("review").rejectionReason = reviewFeedback;
+				reviewFeedback = reviewDecision.reason;
+				reviewPhase.status = "rejected";
+				reviewPhase.decision = "rejected";
+				reviewPhase.rejectionReason = reviewFeedback;
 				updateWidget();
 
 				if (attempt >= maxReviewRetries) {
-					phaseOf("review").status = "error";
-					stopTimer("review");
+					reviewPhase.status = "error";
 					pipelineActive = false;
 					return {
 						success: false,
@@ -756,19 +1039,82 @@ export default function (pi: ExtensionAPI) {
 				return { success: false, summary: "Review gate failed." };
 			}
 
-			// ── Phase 5: Test → (optionally Playwright) loop ──────────────
+			// ── Phase 6+7: Run tests (deterministic) + Test gate loop ──────
 			let testApproved = false;
 
 			for (let attempt = 0; attempt <= maxTestRetries; attempt++) {
-				phaseOf("test").status = "pending";
-				phaseOf("test").retries = attempt;
+				let rawTestOutput = "";
+
+				// Deterministic test run (optional)
+				const runTestsPhase = phaseOf("run-tests");
+				if (resolvedTestCmd && runTestsPhase) {
+					runTestsPhase.status = "running";
+					runTestsPhase.retries = attempt;
+					startTimer("run-tests");
+
+					const testResult = await runDeterministicNode(resolvedTestCmd, buildCwd, (line) => {
+						runTestsPhase.lastWork = line.slice(0, 120);
+						updateWidget();
+					});
+					stopTimer("run-tests");
+					rawTestOutput = testResult.output;
+
+					if (!testResult.success) {
+						runTestsPhase.status = "rejected";
+						runTestsPhase.lastWork = testResult.output.split("\n").filter(Boolean).slice(-2).join(" | ");
+						updateWidget();
+
+						// One agentic CI-fix pass (only if retries remain)
+						if (attempt < maxTestRetries) {
+							const builderDef = agents.get("builder");
+							if (builderDef) {
+								const fixPhase: PhaseState = {
+									name: "ci-fix", label: "CI Fix", agentNames: ["Builder"],
+									status: "running", retries: 0, maxRetries: 1, elapsed: 0, lastWork: "",
+								};
+								await runAgent(
+									builderDef,
+									`## Failing Tests\n${testResult.output.slice(0, 4000)}\n\n## Task\n${task}\n\nFix ALL failing tests.`,
+									`builder-ci-fix-${attempt}`,
+									fixPhase, model, buildCwd,
+								);
+								// Re-run tests after CI fix
+								const retestResult = await runDeterministicNode(resolvedTestCmd, buildCwd, (line) => {
+									runTestsPhase.lastWork = line.slice(0, 120);
+									updateWidget();
+								});
+								rawTestOutput = retestResult.output;
+								runTestsPhase.status = retestResult.success ? "done" : "error";
+								runTestsPhase.lastWork = retestResult.success
+									? "✓ Tests pass after CI fix"
+									: retestResult.output.split("\n").filter(Boolean).slice(-1)[0] ?? "Still failing";
+								updateWidget();
+							}
+						} else {
+							runTestsPhase.status = "error";
+							updateWidget();
+						}
+					} else {
+						runTestsPhase.status = "done";
+						runTestsPhase.lastWork = "✓ All tests pass";
+						updateWidget();
+					}
+				}
+
+				// Agentic test gate
+				const testPhase = phaseOf("test")!;
+				testPhase.status = "pending";
+				testPhase.retries = attempt;
 				startTimer("test");
+
+				const testPrompt = rawTestOutput
+					? `## Raw Test Output\n${rawTestOutput.slice(0, 4000)}\n\n## Task\n${task}\n\nVerify the implementation meets all requirements. End with APPROVED or REJECTED: <reason>.`
+					: `## Task\n${task}\n\nRun tests and verify the implementation. End with APPROVED or REJECTED: <reason>.`;
 
 				const testOutputs = await runPhaseAgents(
 					"tester", testers,
-					Array.from({ length: testers }, () =>
-						`Task: ${task}\n\nRun tests and verify the implementation. End with APPROVED or REJECTED: <reason>.`),
-					phaseOf("test"), model,
+					Array.from({ length: testers }, () => testPrompt),
+					testPhase, model, buildCwd,
 				);
 				const testOutput = testOutputs[0];
 
@@ -776,55 +1122,52 @@ export default function (pi: ExtensionAPI) {
 				if (needsPlaywright(testOutput)) {
 					const pwDef = agents.get("playwright-tester");
 					if (pwDef) {
-						phaseOf("test").agentNames.push("Playwright");
+						testPhase.agentNames.push("Playwright");
 						updateWidget();
 						const { file, resume } = sessionFor("playwright-tester");
 						const pwResult = await runAgentProcess(
 							pwDef,
-							`Task: ${task}\n\nRun browser/UI tests. End with APPROVED or REJECTED: <reason>.`,
+							`## Task\n${task}\n\nRun browser/UI tests. End with APPROVED or REJECTED: <reason>.`,
 							model, file, resume,
 							(delta) => {
-								phaseOf("test").lastWork = delta.split("\n").filter(Boolean).pop() ?? "";
+								testPhase.lastWork = delta.split("\n").filter(Boolean).pop() ?? "";
 								updateWidget();
 							},
+							buildCwd,
 						);
 						if (pwResult.exitCode === 0) agentSessions.set("playwright-tester", file);
 
 						const pwDecision = parseDecision(pwResult.output);
 						if (!pwDecision.approved) {
-							phaseOf("test").status = "rejected";
-							phaseOf("test").rejectionReason = `Playwright: ${pwDecision.reason}`;
+							testPhase.status = "rejected";
+							testPhase.rejectionReason = `Playwright: ${pwDecision.reason}`;
 							stopTimer("test");
 							if (attempt >= maxTestRetries) break;
-							// Retry loop goes back to build phase for a fix
-							phaseOf("build").status = "pending";
-							phaseOf("review").status = "pending";
-							updateWidget();
 							continue;
 						}
 					}
 				}
 
-				const decision = parseDecision(testOutput);
+				const testDecision = parseDecision(testOutput);
 				stopTimer("test");
 
-				if (decision.approved) {
+				if (testDecision.approved) {
 					testApproved = true;
-					phaseOf("test").decision = "approved";
+					testPhase.decision = "approved";
 					break;
 				}
 
-				phaseOf("test").status = "rejected";
-				phaseOf("test").decision = "rejected";
-				phaseOf("test").rejectionReason = decision.reason;
+				testPhase.status = "rejected";
+				testPhase.decision = "rejected";
+				testPhase.rejectionReason = testDecision.reason;
 				updateWidget();
 
 				if (attempt >= maxTestRetries) {
-					phaseOf("test").status = "error";
+					testPhase.status = "error";
 					pipelineActive = false;
 					return {
 						success: false,
-						summary: `Pipeline stopped: tests failed after ${maxTestRetries + 1} attempts.\nLast failure: ${decision.reason}`,
+						summary: `Pipeline stopped: tests failed after ${maxTestRetries + 1} attempts.\nLast failure: ${testDecision.reason}`,
 					};
 				}
 			}
@@ -834,36 +1177,40 @@ export default function (pi: ExtensionAPI) {
 				return { success: false, summary: "Test gate failed." };
 			}
 
-			// ── Phase 6: Commit + PR ───────────────────────────────────────
+			// ── Phase 8: Commit + PR ───────────────────────────────────────
 			if (!skipCommit) {
 				startTimer("commit");
 				const commitDef = agents.get("committer");
+				const commitPhase = phaseOf("commit")!;
+
 				if (!commitDef) {
-					phaseOf("commit").status = "skipped";
+					commitPhase.status = "skipped";
 				} else {
-					phaseOf("commit").status = "pending";
-					phaseOf("commit").agentNames = ["Committer"];
+					commitPhase.status = "pending";
+					commitPhase.agentNames = ["Committer"];
 					updateWidget();
 
 					const { file, resume } = sessionFor("committer");
+					const commitTask = worktreeInfo
+						? `Commit the completed implementation and open a PR to main.\n\nTask: ${task}\n\nYou are in a git worktree on branch "${worktreeInfo.branch}". Run: git add -A && git commit -m "<message>" && git push -u origin ${worktreeInfo.branch} && gh pr create --base main --title "<title>" --body "<body>"`
+						: `Commit the completed implementation and open a PR to main.\n\nTask: ${task}`;
+
 					const commitResult = await runAgentProcess(
-						commitDef,
-						`Commit the completed implementation and open a PR to main.\n\nTask: ${task}`,
-						model, file, resume,
+						commitDef, commitTask, model, file, resume,
 						(delta) => {
-							phaseOf("commit").lastWork = delta.split("\n").filter(Boolean).pop() ?? "";
+							commitPhase.lastWork = delta.split("\n").filter(Boolean).pop() ?? "";
 							updateWidget();
 						},
+						buildCwd,
 					);
-
 					stopTimer("commit");
 
 					if (commitResult.exitCode === 0) {
 						agentSessions.set("committer", file);
-						phaseOf("commit").status = "done";
+						commitPhase.status = "done";
 					} else {
-						phaseOf("commit").status = "error";
-						phaseOf("commit").lastWork = commitResult.output.slice(-200);
+						commitPhase.status = "error";
+						commitPhase.lastWork = commitResult.output.slice(-200);
 					}
 					updateWidget();
 				}
@@ -871,10 +1218,13 @@ export default function (pi: ExtensionAPI) {
 
 			pipelineActive = false;
 			const finalPhase = skipCommit ? "test" : "commit";
-			const finalStatus = phaseOf(finalPhase).status;
+			const finalStatus = phaseOf(finalPhase)?.status;
+			const worktreeNote = worktreeInfo && skipCommit
+				? `\nChanges in worktree: ${worktreeInfo.path} (branch: ${worktreeInfo.branch})`
+				: "";
 			return {
 				success: finalStatus === "done" || finalStatus === "skipped",
-				summary: `Pipeline complete ✓\nScout(${scouts}) → Plan → Build(${builders}) → Review(${reviewers}) → Test(${testers})${skipCommit ? "" : " → Commit"}`,
+				summary: `Pipeline complete ✓\nContext → Scout(${scouts}) → Plan → Build(${builders})${resolvedLintCmd ? " → Lint" : ""} → Review(${reviewers})${resolvedTestCmd ? " → Tests" : ""} → Test(${testers})${skipCommit ? " [no commit]" : " → Commit+PR"}${worktreeNote}`,
 			};
 		} catch (err) {
 			pipelineActive = false;
@@ -886,6 +1236,11 @@ export default function (pi: ExtensionAPI) {
 				updateWidget();
 			}
 			return { success: false, summary: `Pipeline error: ${msg}` };
+		} finally {
+			// Always clean up the worktree after a committed run
+			if (worktreeInfo && !skipCommit) {
+				removeWorktree(cwd, worktreeInfo.path, worktreeInfo.branch);
+			}
 		}
 	}
 
@@ -909,14 +1264,17 @@ export default function (pi: ExtensionAPI) {
 
 		ctx.ui.notify(
 			`Maestro loaded — ${agentCount} agents ready\n\n` +
-			`Pipeline: Scout → Plan → Build → Review Gate → Test Gate → Commit+PR\n` +
-			`Review/test gates loop back on REJECTED (up to 3×/2×)\n\n` +
+			`Pipeline: Context → Scout → Plan → [Worktree] → Build → [Lint] → Review → [Tests] → Test Gate → Commit+PR\n` +
+			`• [Lint] and [Tests] are deterministic nodes — auto-detected, no LLM needed\n` +
+			`• Lint failures trigger agentic lint-fix; CI failures trigger agentic CI-fix\n` +
+			`• Builder and onwards run in an isolated git worktree branch\n` +
+			`• Review/test gates loop back on REJECTED (up to 3×/2×)\n\n` +
 			`/pipeline     Show pipeline status\n` +
 			`/agents       List all agents`,
 			"info",
 		);
 
-		// Footer: model · Maestro | phase | [context bar]%
+		// Footer
 		ctx.ui.setFooter((_tui: any, th: any, _footerData: any) => ({
 			dispose: () => {},
 			invalidate() {},
@@ -950,8 +1308,9 @@ export default function (pi: ExtensionAPI) {
 		name: "run_pipeline",
 		label: "Run Pipeline",
 		description:
-			"Execute the Maestro conditional pipeline: Scout → Plan → Build → Review Gate → Test Gate → Commit+PR. " +
-			"Review and test gates loop back on rejection. Playwright auto-launches for browser tests.",
+			"Execute the Maestro blueprint pipeline: Context → Scout → Plan → [Worktree] → Build → [Lint] → Review → [Tests] → Test Gate → Commit+PR. " +
+			"Deterministic lint/test nodes run directly (no LLM). Failures trigger agentic fix passes. " +
+			"All build/review/test work runs in an isolated git worktree branch.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Full task description — what to implement" }),
 			scouts: Type.Optional(Type.Number({ description: "Number of parallel scout agents (1-3, default 1)", minimum: 1, maximum: 3 })),
@@ -959,6 +1318,9 @@ export default function (pi: ExtensionAPI) {
 			reviewers: Type.Optional(Type.Number({ description: "Number of reviewer agents (default 1)", minimum: 1, maximum: 2 })),
 			testers: Type.Optional(Type.Number({ description: "Number of tester agents (default 1)", minimum: 1, maximum: 2 })),
 			skip_commit: Type.Optional(Type.Boolean({ description: "Skip the commit+PR step (default false)" })),
+			lint_command: Type.Optional(Type.String({ description: "Override auto-detected lint command (e.g. 'bun run lint')" })),
+			test_command: Type.Optional(Type.String({ description: "Override auto-detected test command (e.g. 'bun test')" })),
+			use_worktree: Type.Optional(Type.Boolean({ description: "Create an isolated git worktree branch (default true)" })),
 		}),
 
 		async execute(_id, params, _signal, onUpdate, ctx) {
@@ -970,12 +1332,18 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 
+			// Reload agents before each run
+			agents = loadAgents(cwd);
+
 			const result = await runPipelineFlow(p.task, {
 				scouts: p.scouts ?? 1,
 				builders: p.builders ?? 1,
 				reviewers: p.reviewers ?? 1,
 				testers: p.testers ?? 1,
 				skipCommit: p.skip_commit ?? false,
+				lintCommand: p.lint_command,
+				testCommand: p.test_command,
+				useWorktree: p.use_worktree ?? true,
 			}, ctx);
 
 			return {
@@ -1149,8 +1517,9 @@ You do NOT write code, run tests, or make file changes yourself.
 
 ## Your tools
 
-- **run_pipeline(task, scouts?, builders?, reviewers?, testers?, skip_commit?)** — Run the full conditional pipeline:
-    Scout(s) → Planner → Builder(s) → Review Gate (loops if rejected) → Test Gate (loops if rejected) → Commit+PR
+- **run_pipeline(task, scouts?, builders?, reviewers?, testers?, skip_commit?, lint_command?, test_command?, use_worktree?)** — Run the full blueprint pipeline:
+    Context (deterministic) → Scout(s) → Planner → [Worktree] → Builder(s) → [Lint] → Reviewer(s) → [Tests] → Test Gate → Commit+PR
+    Lint and test nodes are deterministic (direct shell, no LLM). Build/review/test run in an isolated git worktree branch.
     Use this for ANY coding, implementation, or feature task.
 
 - **dispatch_agent(agent, task)** — Dispatch one agent for a focused ad-hoc task.
