@@ -685,7 +685,8 @@ export default function (pi: ExtensionAPI) {
 		const statusLine = theme.fg(statusCol, statusRaw);
 		const statusVisible = statusRaw.length;
 
-		const workRaw = state.task ? (state.lastLine || state.task) : state.def.description;
+		const workRaw = (state.task ? (state.lastLine || state.task) : state.def.description)
+			.replace(/[\r\n]+/g, " ").trim();
 		const workText = trunc(workRaw, Math.min(50, w - 1));
 		const workLine = theme.fg("muted", workText);
 		const workVisible = workText.length;
@@ -827,7 +828,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (card) {
 			card.status = "running";
-			card.task = task.slice(0, 80);
+			card.task = task.replace(/[\r\n]+/g, " ").trim().slice(0, 80);
 			card.elapsed = 0;
 			card.lastLine = "";
 			card.queryCount++;
