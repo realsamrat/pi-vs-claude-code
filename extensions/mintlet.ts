@@ -716,10 +716,11 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── Pipeline Runner ───────────────────────────────────────────────────
 
-	function getModel(ctx: any): string {
-		return ctx.model
-			? `${ctx.model.provider}/${ctx.model.id}`
-			: "claude-cli/claude-sonnet-4-6";
+	function getModel(_ctx: any): string {
+		// Agents always run via claude-cli — they need Claude Code's built-in
+		// bash/read/write tool loop. Using the orchestrator's provider here
+		// would require passing API keys to subprocesses and breaks the design.
+		return "claude-cli/claude-sonnet-4-6";
 	}
 
 	function sessionFor(key: string): { file: string; resume: boolean } {
@@ -1256,8 +1257,9 @@ export default function (pi: ExtensionAPI) {
 		if (widgetCtx) widgetCtx.ui.setWidget("mintlet", undefined);
 		widgetCtx = ctx;
 
-		// Lock down to orchestrator-only tools
-		pi.setActiveTools(["run_pipeline", "dispatch_agent", "commit_and_pr"]);
+		// Disable LLM tool routing — pipeline is triggered directly from user input
+		// (works with any provider including claude-cli which can't call Pi custom tools)
+		pi.setActiveTools([]);
 
 		initAgentCards();
 
@@ -1476,12 +1478,18 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ─── Commands ──────────────────────────────────────────────────────────
+	// ─── Commands & Direct Input Routing ──────────────────────────────────
+	//
+	// Pipeline is triggered directly from user input — no LLM tool routing.
+	// This works with any provider (including claude-cli) because we never
+	// rely on the LLM to call a Pi-registered tool.
 
 	pi.on("input", (event: any, ctx: any) => {
-		if (event.text === "/pipeline") {
+		const text = (event.text as string ?? "").trim();
+
+		if (text === "/pipeline") {
 			if (phases.length === 0) {
-				ctx.ui.notify("No pipeline has run yet. Use run_pipeline to start.", "info");
+				ctx.ui.notify("No pipeline running. Type your task to start.", "info");
 			} else {
 				const lines = phases.map(
 					(p) => `${statusIcon(p.status)} ${p.label.padEnd(14)} ${p.status}${p.rejectionReason ? ` — ${p.rejectionReason}` : ""}`,
@@ -1491,61 +1499,32 @@ export default function (pi: ExtensionAPI) {
 			return { handled: true };
 		}
 
-		if (event.text === "/agents") {
+		if (text === "/agents") {
 			const list = Array.from(agents.values())
 				.map((a) => `  ${displayName(a.name).padEnd(20)} ${a.description}`)
 				.join("\n");
 			ctx.ui.notify(`Mintlet agents:\n${list || "(none found in .pi/agents/mintlet/)"}`, "info");
 			return { handled: true };
 		}
-	});
 
-	// ─── Orchestrator System Prompt ────────────────────────────────────────
+		// Any non-command input triggers the pipeline directly
+		if (!text.startsWith("/") && text.length > 0) {
+			if (pipelineActive) {
+				ctx.ui.notify("Pipeline already running — please wait.", "warn");
+				return { handled: true };
+			}
 
-	pi.on("before_agent_start", async (_event, _ctx) => {
-		const agentList = Array.from(agents.values())
-			.map((a) => `  - ${a.name}: ${a.description}`)
-			.join("\n");
+			ctx.ui.notify(`Starting pipeline: ${text.slice(0, 80)}${text.length > 80 ? "…" : ""}`, "info");
 
-		return {
-			systemPrompt: `You are the Mintlet Orchestrator — the primary agent for this session.
+			runPipelineFlow(text, {}, ctx).then((result) => {
+				ctx.ui.notify(result.summary, result.success ? "info" : "warn");
+			}).catch((err: Error) => {
+				ctx.ui.notify(`Pipeline error: ${err.message}`, "warn");
+				pipelineActive = false;
+				updateWidget();
+			});
 
-Your role is to understand what the user wants and delegate ALL work to specialist agents.
-You do NOT write code, run tests, or make file changes yourself.
-
-## Your tools
-
-- **run_pipeline(task, scouts?, builders?, reviewers?, testers?, skip_commit?, lint_command?, test_command?, use_worktree?)** — Run the full blueprint pipeline:
-    Context (deterministic) → Scout(s) → Planner → [Worktree] → Builder(s) → [Lint] → Reviewer(s) → [Tests] → Test Gate → Commit+PR
-    Lint and test nodes are deterministic (direct shell, no LLM). Build/review/test run in an isolated git worktree branch.
-    Use this for ANY coding, implementation, or feature task.
-
-- **dispatch_agent(agent, task)** — Dispatch one agent for a focused ad-hoc task.
-    Use for quick queries, single-step investigations, or tasks that don't need the full pipeline.
-
-- **commit_and_pr(title, body?)** — Commit current changes and open a PR to main.
-    Use when work is done but commit was skipped from the pipeline.
-
-## Available agents
-${agentList}
-
-## When to use run_pipeline
-- Feature implementation
-- Bug fixes
-- Refactoring
-- Any task that touches code
-
-## When to use dispatch_agent
-- "What files handle X?" → dispatch scout
-- "Explain this code" → dispatch scout
-- "Quick plan for X" → dispatch planner
-
-## Safety
-Damage control rules are active. Dangerous bash commands and protected paths are automatically blocked.
-
-## Starting a session
-Greet the user briefly, confirm you're ready, and ask what they want to build.
-Do NOT run the pipeline automatically — wait for the user's task description.`,
-		};
+			return { handled: true };
+		}
 	});
 }
