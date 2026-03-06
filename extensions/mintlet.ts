@@ -459,12 +459,20 @@ function runAgentProcess(
 	onProgress: (line: string) => void,
 	agentCwd?: string,
 ): Promise<{ output: string; exitCode: number; elapsed: number }> {
+	// When using claude-cli provider, Claude Code handles its own bash/read/write
+	// tool loop internally. Pi's --tools flag would register Pi-level tools that
+	// never get called but DO cause "Tool X not found" errors when claude-cli
+	// emits Claude Code's internal tool_use events back to Pi. Use --no-tools.
+	const toolsArg = model.startsWith("claude-cli/")
+		? ["--no-tools"]
+		: ["--tools", def.tools];
+
 	const args = [
 		"--mode", "json",
 		"-p",
 		"--no-extensions",
 		"--model", model,
-		"--tools", def.tools,
+		...toolsArg,
 		"--thinking", "off",
 		"--append-system-prompt", def.systemPrompt,
 		"--session", sessionFile,
@@ -538,6 +546,16 @@ export default function (pi: ExtensionAPI) {
 	let phases: PhaseState[] = [];
 	let pipelineActive = false;
 	let widgetCtx: any = null;
+
+	// Debounce widget re-renders to avoid rapid TUI shifts during active pipeline
+	let widgetRenderTimer: ReturnType<typeof setTimeout> | null = null;
+	function scheduleWidgetRender() {
+		if (widgetRenderTimer) return;
+		widgetRenderTimer = setTimeout(() => {
+			widgetRenderTimer = null;
+			updateWidget();
+		}, 150);
+	}
 	const agentSessions = new Map<string, string>(); // key → session file path
 	const agentCards = new Map<string, AgentCardState>(); // widget card state per agent
 
@@ -750,7 +768,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const elapsedTimer = setInterval(() => {
-			if (card) { card.elapsed = Date.now() - startTime; updateWidget(); }
+			if (card) { card.elapsed = Date.now() - startTime; scheduleWidgetRender(); }
 		}, 1000);
 
 		const { file, resume } = sessionFor(sessionKey);
@@ -758,7 +776,7 @@ export default function (pi: ExtensionAPI) {
 			const line = delta.split("\n").filter((l) => l.trim()).pop() ?? "";
 			if (card && line) { card.lastLine = line; }
 			phase.lastWork = line || phase.lastWork;
-			updateWidget();
+			scheduleWidgetRender();
 		}, agentCwd);
 
 		clearInterval(elapsedTimer);
