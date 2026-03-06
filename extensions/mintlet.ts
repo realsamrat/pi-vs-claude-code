@@ -450,6 +450,71 @@ function loadAgents(cwd: string): Map<string, AgentDef> {
 
 // ─── Agent Subprocess ────────────────────────────────────────────────────────
 
+/** Spawn `claude --print` directly for claude-cli agents, bypassing Pi's tool router. */
+function runClaudeDirectly(
+	def: AgentDef,
+	task: string,
+	model: string,
+	onProgress: (line: string) => void,
+	agentCwd?: string,
+): Promise<{ output: string; exitCode: number; elapsed: number }> {
+	const modelId = model.replace("claude-cli/", "");
+	const prompt = `<system>\n${def.systemPrompt}\n</system>\n\n${task}`;
+	const spawnEnv = { ...process.env };
+	delete (spawnEnv as any).CLAUDECODE; // prevent nested-session guard
+
+	const args = [
+		"--print",
+		"--verbose",
+		"--output-format", "stream-json",
+		"--dangerously-skip-permissions",
+		"--model", modelId,
+		"-p", prompt,
+	];
+
+	const textChunks: string[] = [];
+	const startTime = Date.now();
+
+	return new Promise((resolve) => {
+		const proc = spawn("claude", args, {
+			stdio: ["ignore", "pipe", "pipe"],
+			env: spawnEnv,
+			cwd: agentCwd,
+		});
+
+		let buffer = "";
+		proc.stdout!.setEncoding("utf-8");
+		proc.stdout!.on("data", (chunk: string) => {
+			buffer += chunk;
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				try {
+					const ev = JSON.parse(line);
+					if (ev.type === "assistant") {
+						for (const part of ev.message?.content ?? []) {
+							if (part.type === "text" && part.text) {
+								textChunks.push(part.text);
+								onProgress(part.text);
+							}
+						}
+					}
+				} catch {}
+			}
+		});
+		proc.stderr!.setEncoding("utf-8");
+		proc.stderr!.on("data", () => {});
+
+		proc.on("close", (code) => {
+			resolve({ output: textChunks.join(""), exitCode: code ?? 1, elapsed: Date.now() - startTime });
+		});
+		proc.on("error", (err) => {
+			resolve({ output: `Spawn error: ${err.message}`, exitCode: 1, elapsed: Date.now() - startTime });
+		});
+	});
+}
+
 function runAgentProcess(
 	def: AgentDef,
 	task: string,
@@ -459,20 +524,21 @@ function runAgentProcess(
 	onProgress: (line: string) => void,
 	agentCwd?: string,
 ): Promise<{ output: string; exitCode: number; elapsed: number }> {
-	// When using claude-cli provider, Claude Code handles its own bash/read/write
-	// tool loop internally. Pi's --tools flag would register Pi-level tools that
-	// never get called but DO cause "Tool X not found" errors when claude-cli
-	// emits Claude Code's internal tool_use events back to Pi. Use --no-tools.
-	const toolsArg = model.startsWith("claude-cli/")
-		? ["--no-tools"]
-		: ["--tools", def.tools];
+	// For claude-cli models: spawn `claude --print` directly instead of going
+	// through a Pi subprocess. Pi's tool routing causes "Tool Read not found"
+	// errors because claude-cli emits Claude Code's internal tool_use events
+	// (named "Read", "Bash") back to Pi, which only knows lowercase "read"/"bash".
+	// Spawning claude directly bypasses Pi's tool router entirely.
+	if (model.startsWith("claude-cli/")) {
+		return runClaudeDirectly(def, task, model, onProgress, agentCwd);
+	}
 
 	const args = [
 		"--mode", "json",
 		"-p",
 		"--no-extensions",
 		"--model", model,
-		...toolsArg,
+		"--tools", def.tools,
 		"--thinking", "off",
 		"--append-system-prompt", def.systemPrompt,
 		"--session", sessionFile,
