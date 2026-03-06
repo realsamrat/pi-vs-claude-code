@@ -340,15 +340,20 @@ function detectTestCommand(cwd: string): string | null {
 function createWorktree(
 	cwd: string,
 	runId: string,
-): { path: string; branch: string } | null {
+): { path: string; branch: string; root: string } | null {
 	const branch = `mintlet-run-${runId}`;
-	const worktreePath = join(tmpdir(), branch);
+	const worktreeRoot = join(tmpdir(), branch);
 	try {
-		execSync(`git worktree add -b "${branch}" "${worktreePath}" HEAD`, {
-			cwd,
+		// Find the git repo root so we can compute the relative path of cwd inside it
+		const gitRoot = execSync("git rev-parse --show-toplevel", { cwd }).toString().trim();
+		execSync(`git worktree add -b "${branch}" "${worktreeRoot}" HEAD`, {
+			cwd: gitRoot,
 			stdio: "ignore",
 		});
-		return { path: worktreePath, branch };
+		// If cwd is a subdirectory of the git root, mirror that path inside the worktree
+		const rel = cwd.startsWith(gitRoot) ? cwd.slice(gitRoot.length).replace(/^\//, "") : "";
+		const path = rel ? join(worktreeRoot, rel) : worktreeRoot;
+		return { path, branch, root: worktreeRoot };
 	} catch {
 		return null;
 	}
@@ -1239,7 +1244,7 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			// Always clean up the worktree after a committed run
 			if (worktreeInfo && !skipCommit) {
-				removeWorktree(cwd, worktreeInfo.path, worktreeInfo.branch);
+				removeWorktree(cwd, worktreeInfo.root, worktreeInfo.branch);
 			}
 		}
 	}
@@ -1263,14 +1268,7 @@ export default function (pi: ExtensionAPI) {
 		updateWidget();
 
 		ctx.ui.notify(
-			`Mintlet loaded — ${agentCount} agents ready\n\n` +
-			`Pipeline: Context → Scout → Plan → [Worktree] → Build → [Lint] → Review → [Tests] → Test Gate → Commit+PR\n` +
-			`• [Lint] and [Tests] are deterministic nodes — auto-detected, no LLM needed\n` +
-			`• Lint failures trigger agentic lint-fix; CI failures trigger agentic CI-fix\n` +
-			`• Builder and onwards run in an isolated git worktree branch\n` +
-			`• Review/test gates loop back on REJECTED (up to 3×/2×)\n\n` +
-			`/pipeline     Show pipeline status\n` +
-			`/agents       List all agents`,
+			`Mintlet ready — ${agentCount} agents · /pipeline · /agents`,
 			"info",
 		);
 
